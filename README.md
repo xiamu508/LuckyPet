@@ -18,7 +18,7 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 
 和常见的桌宠实现不同，本项目**不是**打包 Electron 或 Python 运行时，而是用 Swift + AppKit
 直接写成原生 `.app`：透明无边框窗口、AVFoundation 硬件解码带 Alpha 通道的 HEVC 动画、
-自绘气泡、菜单栏常驻。安装体积 344MB，其中 343MB 是动画素材。
+自绘气泡、菜单栏常驻。动画预处理在构建时完成，运行应用无需 Python、超分模型或联网。
 
 提醒功能是本项目相对原版桌宠的主要增补：固定间隔循环、可编辑文案池、
 午休/夜间免打扰、临时暂停、今日计数。
@@ -55,61 +55,80 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 
 ### 方式一：下载打包好的应用
 
-从 [Releases](https://github.com/xiamu508/LuckyPet/releases) 下载 `LuckyPet.zip`，解压后拖到「应用程序」文件夹。
+2K 素材使包体达到 **2.42 GiB**，超过 GitHub 单文件 2 GiB 上限，因此 `v1.1.0` 的 `LuckyPet.zip` 切成两个分卷：
+
+| 文件 | 大小 |
+|---|---|
+| `LuckyPet-1.1.0-arm64.zip.001` | 1.86 GiB |
+| `LuckyPet-1.1.0-arm64.zip.002` | 578 MiB |
+
+把两个文件下载到同一目录，在终端合并后解压：
+
+```bash
+cat LuckyPet-1.1.0-arm64.zip.001 LuckyPet-1.1.0-arm64.zip.002 > LuckyPet.zip
+unzip LuckyPet.zip
+```
+
+合并后的完整包 SHA-256（可选核对）：
+
+```text
+10ff6033645772dc6160a94f04a0f72a7b723ad58afe903714699031049b1e1a
+```
+
+把解压出的 `LuckyPet.app` 拖到「应用程序」文件夹。
 
 首次打开需 **右键 → 打开**（本项目使用 ad-hoc 签名，未做 Apple 公证）。
 
 ### 方式二：从源码构建
 
-需要 Xcode 命令行工具（Swift 6+）、ffmpeg 与 numpy（`pip install numpy`）。
+需要 Xcode 命令行工具（Swift 6+）、ffmpeg，以及仅用于素材处理的 Python 3.12 环境。
+本修复版使用原始透明通道和 Real-ESRGAN 动画模型，统一输出 2560×1440 HEVC with Alpha。
 
 ```bash
-git clone https://github.com/xiamu508/LuckyPet.git
-cd LuckyPet
+# 所有依赖、缓存和模型都放在当前项目
+UV_CACHE_DIR="$PWD/.cache/uv" uv venv --python 3.12 .venv
+UV_CACHE_DIR="$PWD/.cache/uv" uv pip install --python .venv/bin/python -r requirements-hd.txt
 
-# 1. 下载动画素材（约 52MB，来自上游 MIT 项目）
+# 固定上游版本并逐文件校验，避免素材在重建时漂移
 python3 scripts/fetch_assets.py
+python3 scripts/download_model.py
 
-# 2. 抠图 + 转码：黑底 WebM → 颜色反混合 → 带 Alpha 的 HEVC（1280×720）
-python3 scripts/rematte.py --src assets_raw --dst Assets/clips
+# 保留 VP9 原始透明通道、去白底污染、稳定边缘并对完整动画做 4× 超分
+.venv/bin/python scripts/animation_hd.py --device mps --workers 2
 
-# 3. 构建 .app
+# 构建可直接运行的原生应用
 ./build.sh
 ```
 
-> `scripts/transcode.py` 与 `scripts/upscale_hd.py` 是旧管线（`colorkey` 直接出 alpha），
-> 边缘会残留黑边，仅为兼容保留；新管线用 `rematte.py`。
+产物：`dist/LuckyPet.app`。模型、Python 环境和原始素材不会打进应用。
+`Assets/hd_manifest.json` 记录源文件/成品哈希、分辨率、帧率、帧数及模型版本，重跑会校验后续传。
 
-产物：`dist/LuckyPet.app`
+## 本次画质与窗口修复
 
-> 素材没有放进仓库（153MB），由脚本从上游获取并按上述管线在本地转码。
-> 这样既避免仓库臃肿，也让素材的来源与许可关系保持清晰。
+原始动画为 **640×360 VP9 with Alpha**，并非无透明通道的黑底素材。旧管线以 FFmpeg 默认 VP9
+解码器读取 RGB，实际丢弃了独立 alpha 位流，再把错误的 RGB 当成黑底重新抠图。背景残色
+因此变成亮色碎边，随动画变化而闪烁。
 
-## 关于清晰度
+修复后的素材管线：
 
-素材上限是上游的 **640×360**，角色在画面中实际只占 **213×271 px**。显示时的对应关系：
+1. 指定 `libvpx-vp9` 解码，保留源 alpha。
+2. 按源 alpha 反解混入的白底颜色，仅对不稳定的低 alpha 亮边借用邻近角色颜色，保留不透明的白色蕾丝与图案。
+3. 清除极低 alpha 背景底板，做亚像素轮廓收缩和运动补偿的透明度稳定。
+4. 使用 Real-ESRGAN `realesr-animevideov3` 提升连续动画细节，输出 **2560×1440**，保持源帧率和帧数。
+5. 以 HEVC Alpha 最高可用透明度质量档编码，并通过 macOS 原生解码复查。
 
-| `petScale` | 角色显示宽度 | 物理像素（2× 屏） | 相对源素材 |
-|---|---|---|---|
-| 0.45 | 约 96pt | 约 192px | 缩小，有余量 |
-| 0.70（默认） | 约 149pt | 约 298px | 放大 1.4× |
-| 1.00 | 约 213pt | 约 426px | 接近 1:1 |
+模型会重建低分辨率素材的细节，结果不等同于获得原始高精度模型。角色设计、动作和动画时长保持一致。
 
-1280×720 素材属于 **2× 超采样**，本质是超采样抗锯齿，**不会凭空产生细节**。
+显示窗口同时改为容纳完整 **640×360 逻辑画布**，气泡区独立放在上方。角色逻辑显示尺寸不因
+素材超分而改变；摆尾、跳跃、道具和特效在原始画布中的内容都能显示。缩放、拖动和屏幕切换时
+会限制整个窗口留在屏幕可见区域内。透明区域通过当前视频帧 alpha 做鼠标穿透，避免扩大画布后挡住桌面。
+视频层随屏幕更新 Retina 像素密度，循环播放使用 `AVPlayerLooper`。
 
-影响观感的**主要因素其实是抠图质量，不是分辨率**：
+`inspection/comparison-encoded.png` 与 `inspection/comparison-motion.mp4` 对比的是旧、新 HEVC
+动画经 macOS 解码后的画面。`inspection/render-smoke/render-smoke.json` 记录原生应用实际渲染、
+WindowServer 窗口尺寸、缩放、循环、动作切换和靠边显示检查。
 
-- 旧管线用 `ffmpeg colorkey` 出 alpha，边缘像素的 RGB 仍是被黑底压暗的混合值
-  （`C = α·F`），播放端再按 straight alpha 合成一次 → 角色被描上一圈断续黑边。
-  实测边缘色差均值 **78.5**，57–63% 的边缘像素偏暗，全库 106 段一致。
-- `scripts/rematte.py` 改为**颜色反混合**：先由纯黑背景得到确定前景（core），
-  用邻域 core 色估计真实颜色 `F`，`alpha = max_c(C/F)`，边缘输出 `F` 而非观测值。
-  色差降至 ~60，暗边基本消失，帧间边缘抖动从 **53.7% → 13.2%**（更稳定，不闪）。
-- 顺带把编码从 `q:v 42 / alpha_quality 0.50` 提到 `q:v 62 / 0.85`，块效应与 alpha
-  阶梯同时改善。代价是码率从约 1.1 Mbps 升到 2.2–2.5 Mbps，素材 153MB → 343MB。
-
-仍然存在的硬限制：源素材角色仅 213×271 px，`petScale > 0.7` 时属于放大显示，
-边缘会偏软。要真正提升只有两条路 —— AI 超分，或重绘/重建模。
+旧 `transcode.py` / `upscale_hd.py` 只保留为历史参考，不再用于构建。`rematte.py` 转发至新管线。
 
 ## 配置
 
@@ -136,6 +155,7 @@ LuckyPet/
 │   ├── main.swift            入口
 │   ├── AppDelegate.swift     生命周期、菜单栏、右键菜单、通知、提醒投递
 │   ├── PetWindow.swift       透明置顶窗口、动画调度、拖拽与抛掷物理、气泡
+│   ├── PetVideoView.swift    AVPlayerLooper 视频层、Retina 像素密度、逐帧 alpha 穿透
 │   ├── BubbleOverlay.swift   气泡视图（CALayer 卡片 + 文字层）
 │   ├── ClipLibrary.swift     素材索引
 │   ├── ReminderEngine.swift  提醒引擎
@@ -143,9 +163,16 @@ LuckyPet/
 │   └── Preferences.swift     配置模型与持久化
 ├── scripts/
 │   ├── fetch_assets.py       从上游下载素材（MIT）
-│   ├── rematte.py            颜色反混合抠图 + HEVC Alpha 编码（当前管线）
-│   ├── transcode.py          旧管线：colorkey 抠图（保留兼容）
-│   ├── upscale_hd.py         旧管线：2× 超采样（保留兼容）
+│   ├── animation_hd.py       当前管线：保留原 alpha → 反解白底污染 → Real-ESRGAN → HEVC Alpha
+│   ├── download_model.py     下载 Real-ESRGAN 动画模型（不随应用分发）
+│   ├── download_torch.py     下载与本机匹配的 PyTorch 轮子
+│   ├── install_tools.py      安装项目内工具链
+│   ├── verify_assets.py      素材哈希 / 分辨率 / 帧数校验
+│   ├── quality_check.py      边缘色差与 alpha 质量检查
+│   ├── run_render_test.py    原生渲染自检（窗口尺寸、循环、交互）
+│   ├── rematte.py            旧入口，转发至 animation_hd.py
+│   ├── transcode.py          历史管线：colorkey 抠图（保留兼容）
+│   ├── upscale_hd.py         历史管线：2× 超采样（保留兼容）
 │   └── assets_manifest.json  素材清单（109 个文件）
 ├── icon_work/gen_icon.swift  应用图标生成脚本
 ├── build.sh                  一键构建

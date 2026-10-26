@@ -23,3 +23,10 @@ icon_work/char*.png
 
 # 上游参考代码副本（仅本地阅读，不入库）
 ref/
+
+# Project-local repair tools, model weights, caches and validation media
+.venv/
+.cache/
+tools/
+inspection/
+__pycache__/

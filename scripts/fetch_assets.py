@@ -1,76 +1,69 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""从上游开源项目下载角色动画素材（MIT 许可）。
-
-用法：
-    python3 scripts/fetch_assets.py            # 下载全部
-    python3 scripts/fetch_assets.py --workers 4
-
-素材来源：https://github.com/MerZlin/dsh-pet-indesktop
-许可：MIT (Copyright (c) 2026 Merzlin)，详见 NOTICE.md
-"""
+"""Fetch the pinned upstream animations; verify each Git blob before using it."""
 import argparse
+import base64
+import hashlib
 import json
-import os
-import sys
-import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MANIFEST = os.path.join(ROOT, 'scripts', 'assets_manifest.json')
-OUT_DIR = os.path.join(ROOT, 'assets_raw')
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / 'scripts/assets_manifest.json'
+OUT_DIR = ROOT / 'assets_raw'
 
 
-def download(session_base, rel, overwrite=False):
-    dst = os.path.join(OUT_DIR, rel)
-    if os.path.exists(dst) and os.path.getsize(dst) > 0 and not overwrite:
-        return 'skip'
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    url = session_base + urllib.parse.quote(rel)
-    for attempt in range(3):
-        try:
-            data = urllib.request.urlopen(url, timeout=45).read()
-            with open(dst, 'wb') as f:
-                f.write(data)
-            return 'ok'
-        except Exception as e:
-            if attempt == 2:
-                print(f'  FAIL {rel}: {e}', flush=True)
-                return 'fail'
-            time.sleep(1.0)
-    return 'fail'
+def blob_id(data):
+    return hashlib.sha1(f'blob {len(data)}\0'.encode() + data).hexdigest()
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--workers', type=int, default=6)
-    ap.add_argument('--overwrite', action='store_true')
-    args = ap.parse_args()
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workers',type=int,default=6)
+    parser.add_argument('--only',nargs='*')
+    parser.add_argument('--api',action='store_true',help='Use GitHub blob API when raw CDN times out')
+    args=parser.parse_args()
+    manifest=json.loads(MANIFEST.read_text())
+    clips=args.only or manifest['clips']
+    base=manifest['raw_base']+manifest['upstream_path']
 
-    m = json.load(open(MANIFEST, encoding='utf-8'))
-    base = m['raw_base'] + m['upstream_path']
-    clips = m['clips']
-    print(f"素材来源: {m['source_repo']}")
-    print(f"许可: {m['license']}")
-    print(f"共 {len(clips)} 个文件 → {OUT_DIR}\n", flush=True)
+    def download(rel):
+        dest=OUT_DIR/rel
+        expected=manifest['blob_sha1'][rel]
+        if dest.exists() and blob_id(dest.read_bytes())==expected:
+            return rel,'verified'
+        dest.parent.mkdir(parents=True,exist_ok=True)
+        for attempt in range(3):
+            try:
+                url=(f'https://api.github.com/repos/MerZlin/dsh-pet-indesktop/git/blobs/{expected}'
+                     if args.api or attempt > 0 else base+urllib.parse.quote(rel))
+                req=urllib.request.Request(url,headers={'User-Agent':'LuckyPet-local-repair'})
+                with urllib.request.urlopen(req,timeout=55) as response:
+                    data=response.read()
+                if 'api.github.com/' in url:
+                    data=base64.b64decode(json.loads(data)['content'])
+                if blob_id(data)!=expected:
+                    raise ValueError('Upstream blob checksum mismatch')
+                part=dest.with_suffix(dest.suffix+'.download')
+                part.write_bytes(data)
+                part.replace(dest)
+                return rel,'downloaded'
+            except Exception as exc:
+                print(f'RETRY {attempt+1}/3 {rel}: {exc}',flush=True)
+        return rel,'FAILED'
 
-    os.makedirs(OUT_DIR, exist_ok=True)
-    stat = {'ok': 0, 'skip': 0, 'fail': 0}
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        for i, r in enumerate(ex.map(lambda c: download(base, c, args.overwrite), clips), 1):
-            stat[r] += 1
-            if i % 20 == 0:
-                print(f"  进度 {i}/{len(clips)}  {stat}", flush=True)
-
-    print(f"\n完成: {stat}")
-    if stat['fail']:
-        print("存在失败项，可重复运行本脚本续传。")
-        return 1
-    print("下一步: python3 scripts/transcode.py")
-    return 0
+    print('Pinned revision:',manifest['source_revision'],flush=True)
+    failed=[]
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        for i,(rel,status) in enumerate(executor.map(download,clips),1):
+            print(f'{i}/{len(clips)} {status} {rel}',flush=True)
+            if status=='FAILED':
+                failed.append(rel)
+    if failed:
+        raise SystemExit(f'Download failed: {failed}')
+    print('All source assets verified.',flush=True)
 
 
-if __name__ == '__main__':
-    sys.exit(main())
+if __name__=='__main__':
+    main()

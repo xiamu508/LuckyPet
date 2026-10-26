@@ -28,6 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pet.orderFrontRegardless()
         pet.playIdle()
 
+        if let testDirectory = ProcessInfo.processInfo.environment["PET_RENDER_TEST_DIR"] {
+            runRenderTest(directory: URL(fileURLWithPath: testDirectory, isDirectory: true))
+            return
+        }
+
         pet.onClicked = { [weak self] point in
             guard let self else { return }
             self.pet.playClick()
@@ -54,6 +59,88 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if ProcessInfo.processInfo.environment["PET_SELFTEST"] == "1" {
             runSelfTest()
+        }
+    }
+
+    /// 隔离的原生视频渲染自检；不启动提醒、不请求通知权限。
+    private func runRenderTest(directory: URL) {
+        var observations: [[String: Any]] = []
+        func record(_ phase: String) {
+            var data = pet.renderDiagnostics
+            data["phase"] = phase
+            observations.append(data)
+            NSLog("[RenderTest] %@ %@", phase, String(describing: data))
+        }
+        let checks: [(Double, () -> Void)] = [
+            (1, { record("idle") }),
+            (2, { self.pet.applyScale(0.45) }),
+            (3, { record("small"); self.pet.applyScale(0.95) }),
+            (4, { record("large"); self.pet.applyScale(0.70) }),
+            (12, { record("idle-after-loop") }),
+            (13, { self.pet.playClick() }),
+            (15, { record("click") }),
+            (25, { record("return-to-idle"); self.pet.playDragFeedback() }),
+            (27, { record("drag"); self.pet.playIdle() }),
+            (29, { record("idle-restored") }),
+            (30, {
+                if let clip = self.library.random.clips.first(where: { $0.lastPathComponent == "蓝鲸现世.mov" }) {
+                    self.pet.play(url: clip, loop: false, state: "wide-animation")
+                }
+            }),
+            (32, { record("wide-animation") }),
+            (34, {
+                if let clip = self.library.random.clips.first(where: { $0.lastPathComponent == "放烟花.mov" }) {
+                    self.pet.play(url: clip, loop: false, state: "full-canvas-effects")
+                }
+            }),
+            (36, { record("full-canvas-effects") }),
+            (38, {
+                if let screen = self.pet.screen {
+                    self.pet.setFrameOrigin(NSPoint(x: screen.visibleFrame.maxX - 10, y: screen.visibleFrame.maxY - 10))
+                    self.pet.keepFullyOnScreen()
+                }
+                record("screen-edge")
+            }),
+            (39, {
+                self.pet.showBubble(text: "完整动画与提醒气泡显示检查", duration: 8)
+            }),
+            (41, { record("bubble") })
+        ]
+        for (delay, action) in checks {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { action() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 42) {
+            let expectedStates = ["idle": "idle", "idle-after-loop": "idle", "click": "click",
+                                  "return-to-idle": "idle", "drag": "drag", "idle-restored": "idle",
+                                  "wide-animation": "wide-animation", "full-canvas-effects": "full-canvas-effects"]
+            let ok = observations.allSatisfy { observation in
+                (expectedStates[observation["phase"] as? String ?? ""].map { expected in
+                    expected == (observation["state"] as? String)
+                } ?? true) &&
+                ((observation["phase"] as? String != "idle-after-loop") || ((observation["loopCount"] as? Int ?? 0) >= 1)) &&
+                (observation["serverMatchesFrame"] as? Bool == true) &&
+                (observation["hasHitPixels"] as? Bool == true) &&
+                (observation["canvasInsideWindow"] as? Bool == true) &&
+                (observation["windowFullyOnScreen"] as? Bool == true) &&
+                ((observation["state"] as? String != "idle") ||
+                 ((observation["transparentCornerPassesThrough"] as? Bool == true) &&
+                  (observation["centerReceivesMouse"] as? Bool == true))) &&
+                (observation["timeControlStatus"] as? Int == 2) &&
+                ((observation["rate"] as? Float ?? 0) > 0) &&
+                (observation["readyForDisplay"] as? Bool == true) &&
+                (observation["itemStatus"] as? Int == 1) &&
+                ((observation["videoWidth"] as? CGFloat) == 2560) &&
+                ((observation["videoHeight"] as? CGFloat) == 1440) &&
+                ((observation["backingScale"] as? CGFloat) == (observation["layerScale"] as? CGFloat)) &&
+                ((observation["error"] as? String) == "")
+            }
+            let report: [String: Any] = ["passed": ok, "observations": observations]
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: directory.appendingPathComponent("render-smoke.json"))
+            }
+            NSLog("[RenderTest] completed passed=%@", String(ok))
+            NSApp.terminate(nil)
         }
     }
 
@@ -107,10 +194,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func screenChanged() {
         guard let pet else { return }
-        let visible = NSScreen.screens.contains {
-            $0.visibleFrame.intersects(pet.frame)
+        if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(pet.frame) }) {
+            pet.keepFullyOnScreen()
+        } else {
+            pet.placeAtDefaultPosition()
         }
-        if !visible { pet.placeAtDefaultPosition() }
     }
 
     // MARK: - 状态栏

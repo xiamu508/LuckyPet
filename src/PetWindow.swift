@@ -5,26 +5,31 @@ import AVFoundation
 @MainActor
 final class PetWindow: NSWindow {
 
-    // 视频源 1280×720（2× 超采样）；角色逻辑占位约 308×310，窗口按此裁剪
-    static let sourceWidth: CGFloat = 1280
-    static let sourceHeight: CGFloat = 720
-    static let cropWidth: CGFloat = 308
-    static let cropHeight: CGFloat = 310
-    static let cropCenterX: CGFloat = 640
-    static let cropCenterY: CGFloat = 392
+    // 几何使用 640×360 逻辑画布；视频分辨率可独立提高，角色显示大小保持稳定。
+    static let sourceWidth: CGFloat = 640
+    static let sourceHeight: CGFloat = 360
+    static let bubbleWidth: CGFloat = 308
     /// 顶部常驻气泡区高度（窗口固定高度，避免动态 resize 不提交到 WindowServer）
     static let bubbleArea: CGFloat = 96
     static let bubbleAreaTail: CGFloat = 9
 
-    private let player = AVPlayer()
-    private let playerLayer = AVPlayerLayer()
-    private let videoHost = NSView()
+    private let player = AVQueuePlayer()
+    private var playerLooper: AVPlayerLooper?
+    private let videoHost = PetVideoView(frame: .zero)
+    private var playerLayer: AVPlayerLayer { videoHost.playerLayer }
     private let cardLayer = CALayer()
     private let textLayer = CATextLayer()
     private var endObserver: NSObjectProtocol?
     private var currentURL: URL?
     private var currentLoop = false
     private var currentRate: Float = 1.0
+    private let hitOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+    ])
+    private weak var hitOutputItem: AVPlayerItem?
+    private var hitPixelBuffer: CVPixelBuffer?
+    private var pointerTimer: Timer?
+    private var pointerIsDown = false
 
     private(set) var state: String = "idle"
 
@@ -56,15 +61,15 @@ final class PetWindow: NSWindow {
     var onStateChanged: ((String) -> Void)?
 
     var bodySize: NSSize {
-        NSSize(width: Self.cropWidth * prefs.petScale,
-               height: Self.cropHeight * prefs.petScale)
+        NSSize(width: Self.sourceWidth * prefs.petScale,
+               height: Self.sourceHeight * prefs.petScale)
     }
 
     init(library: ClipLibrary, prefs: Preferences) {
         self.library = library
         self.prefs = prefs
-        let w = Self.cropWidth * prefs.petScale
-        let h = Self.cropHeight * prefs.petScale + Self.bubbleArea
+        let w = Self.sourceWidth * prefs.petScale
+        let h = Self.sourceHeight * prefs.petScale + Self.bubbleArea
         super.init(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                    styleMask: [.borderless],
                    backing: .buffered,
@@ -80,34 +85,26 @@ final class PetWindow: NSWindow {
 
         let container = PetContentView(frame: NSRect(x: 0, y: 0, width: w, height: h))
 
-        videoHost.wantsLayer = true
-        videoHost.layer?.backgroundColor = NSColor.clear.cgColor
-        videoHost.layer?.masksToBounds = false
         playerLayer.player = player
-        playerLayer.videoGravity = .resize
-        playerLayer.backgroundColor = NSColor.clear.cgColor
-        playerLayer.isOpaque = false
-        videoHost.layer?.addSublayer(playerLayer)
         container.addSubview(videoHost)
         contentView = container
 
-
-
-        let overlay = BubbleOverlayView(frame: NSRect(x: 0, y: Self.cropHeight * prefs.petScale,
-                                                     width: w, height: Self.bubbleArea))
-        overlay.wantsLayer = true
-
-        container.addSubview(overlay)
-        bubbleOverlay = overlay
-
-        let ov = BubbleOverlayView(frame: NSRect(x: 0, y: Self.cropHeight * prefs.petScale,
-                                                 width: w, height: Self.bubbleArea))
+        let bubbleW = Self.bubbleWidth * prefs.petScale
+        let ov = BubbleOverlayView(frame: NSRect(x: (w - bubbleW) / 2, y: Self.sourceHeight * prefs.petScale,
+                                                 width: bubbleW, height: Self.bubbleArea))
         container.addSubview(ov)
         bubbleOverlay = ov
 
         player.actionAtItemEnd = .none
         player.isMuted = true
+        player.automaticallyWaitsToMinimizeStalling = false
         applyGeometry()
+        hitOutput.suppressesPlayerRendering = false
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updatePointerHitTesting() }
+        }
+        pointerTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
     }
 
     override var canBecomeKey: Bool { true }
@@ -115,28 +112,91 @@ final class PetWindow: NSWindow {
 
     // MARK: - 几何
 
-    /// 按当前缩放，把视频层摆到使角色居中的位置（窗口高度含气泡区）
+    /// 窗口容纳完整 640×360 动画画布，头顶另留气泡区；不裁剪动作和特效。
     func applyGeometry() {
         let s = CGFloat(prefs.petScale)
-        let roleW = Self.cropWidth * s
-        let roleH = Self.cropHeight * s
-        let totalH = roleH + Self.bubbleArea
-        let origin = frame.origin
-        setFrame(NSRect(origin: origin, size: NSSize(width: roleW, height: totalH)), display: true)
+        let canvasW = Self.sourceWidth * s
+        let canvasH = Self.sourceHeight * s
+        let totalH = canvasH + Self.bubbleArea
+        let origin = NSPoint(x: frame.midX - canvasW / 2, y: frame.minY)
+        setFrame(NSRect(origin: origin, size: NSSize(width: canvasW, height: totalH)), display: true)
 
-        // 素材为 1280×720（2× 像素密度），显示时按 s/2 折算，视觉尺寸保持不变
-        let vs = s / 2
-        let vw = Self.sourceWidth * vs
-        let vh = Self.sourceHeight * vs
-        let x = roleW / 2 - Self.cropCenterX * vs
-        // 视频区相对窗口底部（气泡占据顶部，不影响角色位置）
-        let y = roleH / 2 - (Self.sourceHeight - Self.cropCenterY) * vs
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        videoHost.frame = NSRect(x: x, y: y, width: vw, height: vh)
-        playerLayer.frame = CGRect(x: 0, y: 0, width: vw, height: vh)
+        videoHost.frame = NSRect(x: 0, y: 0, width: canvasW, height: canvasH)
+        playerLayer.frame = videoHost.bounds
+        videoHost.updateBackingScale()
         CATransaction.commit()
-        bubbleOverlay?.frame = NSRect(x: 0, y: roleH, width: roleW, height: Self.bubbleArea)
+        let bubbleW = Self.bubbleWidth * s
+        bubbleOverlay?.frame = NSRect(x: (canvasW - bubbleW) / 2, y: canvasH,
+                                      width: bubbleW, height: Self.bubbleArea)
+        if isVisible { keepFullyOnScreen() }
+    }
+
+    /// 透明区域穿透桌面，只在当帧实际可见的像素或提醒气泡上接收鼠标。
+    private func refreshHitPixels() {
+        if player.currentItem !== hitOutputItem {
+            hitOutputItem?.remove(hitOutput)
+            hitOutputItem = player.currentItem
+            hitOutputItem?.add(hitOutput)
+            hitPixelBuffer = nil
+        }
+        let time = hitOutput.itemTime(forHostTime: CACurrentMediaTime())
+        if hitOutput.hasNewPixelBuffer(forItemTime: time),
+           let buffer = hitOutput.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) {
+            hitPixelBuffer = buffer
+        }
+    }
+
+    private func isVisiblePixel(at point: NSPoint) -> Bool {
+        if isBubbleVisible, bubbleOverlay?.frame.contains(point) == true { return true }
+        guard videoHost.frame.contains(point) else { return false }
+        guard let pixel = hitPixelBuffer else {
+            // 解码器尚未输出首帧时，只允许角色中心区域交互。
+            let s = CGFloat(prefs.petScale)
+            return NSRect(x: (Self.sourceWidth - 240) * s / 2, y: 20 * s,
+                          width: 240 * s, height: 300 * s).contains(point)
+        }
+        let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
+        let local = videoHost.convert(point, from: nil)
+        let x = min(width - 1, max(0, Int(local.x / videoHost.bounds.width * CGFloat(width))))
+        let y = min(height - 1, max(0, Int((1 - local.y / videoHost.bounds.height) * CGFloat(height))))
+        CVPixelBufferLockBaseAddress(pixel, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixel) else { return false }
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        return bytes[y * CVPixelBufferGetBytesPerRow(pixel) + x * 4 + 3] > 12
+    }
+
+    private func updatePointerHitTesting() {
+        guard isVisible else { ignoresMouseEvents = true; return }
+        if player.currentItem !== hitOutputItem { refreshHitPixels() }
+        guard !pointerIsDown else { ignoresMouseEvents = false; return }
+        let point = mouseLocationOutsideOfEventStream
+        guard contentView?.bounds.contains(point) == true else { ignoresMouseEvents = true; return }
+        refreshHitPixels()
+        ignoresMouseEvents = !isVisiblePixel(at: point)
+    }
+
+    private func constrainedOrigin(_ origin: NSPoint, on screen: NSScreen) -> NSPoint {
+        let visible = screen.visibleFrame
+        return NSPoint(x: min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - frame.width)),
+                       y: min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - frame.height)))
+    }
+
+    func keepFullyOnScreen() {
+        guard let target = screen ?? NSScreen.main else { return }
+        let visible = target.visibleFrame
+        if frame.width > visible.width || frame.height > visible.height {
+            let fit = min(visible.width / Self.sourceWidth,
+                          max(1, visible.height - Self.bubbleArea) / Self.sourceHeight)
+            applyScale(fit)
+            return
+        }
+        let origin = constrainedOrigin(frame.origin, on: target)
+        let density = backingScaleFactor
+        setFrameOrigin(NSPoint(x: (origin.x * density).rounded() / density,
+                               y: (origin.y * density).rounded() / density))
     }
 
     // MARK: - 气泡
@@ -144,16 +204,17 @@ final class PetWindow: NSWindow {
     func showBubble(text: String, duration: TimeInterval, emphasize: Bool = false) {
         bubbleHideTimer?.invalidate()
         let s = CGFloat(prefs.petScale)
-        let roleW = Self.cropWidth * s
-        let roleH = Self.cropHeight * s
+        let roleW = Self.bubbleWidth * s
+        let roleH = Self.sourceHeight * s
+        let bubbleX = (Self.sourceWidth * s - roleW) / 2
 
         if bubbleOverlay == nil {
-            let v = BubbleOverlayView(frame: NSRect(x: 0, y: roleH, width: roleW, height: Self.bubbleArea))
+            let v = BubbleOverlayView(frame: NSRect(x: bubbleX, y: roleH, width: roleW, height: Self.bubbleArea))
             contentView?.addSubview(v)
             bubbleOverlay = v
         }
         guard let overlay = bubbleOverlay else { return }
-        overlay.frame = NSRect(x: 0, y: roleH, width: roleW, height: Self.bubbleArea)
+        overlay.frame = NSRect(x: bubbleX, y: roleH, width: roleW, height: Self.bubbleArea)
         overlay.restoreBackground()
         let cardH = overlay.update(text: text, emphasized: emphasize, cardWidth: roleW)
         bubbleHeight = cardH
@@ -173,7 +234,12 @@ final class PetWindow: NSWindow {
     }
 
     func applyScale(_ scale: Double) {
-        prefs.petScale = scale
+        let visible = (screen ?? NSScreen.main)?.visibleFrame
+        let maxScale = visible.map { min($0.width / Self.sourceWidth, ($0.height - Self.bubbleArea) / Self.sourceHeight) } ?? 1.0
+        let requested = min(max(scale, 0.25), maxScale)
+        let density = backingScaleFactor
+        // 画布宽度取整到物理像素，同时保持视频宽高比。
+        prefs.petScale = (requested * Self.sourceWidth * density).rounded(.down) / (Self.sourceWidth * density)
         applyGeometry()
         prefs.save()
     }
@@ -195,26 +261,51 @@ final class PetWindow: NSWindow {
         self.state = state
         onStateChanged?(state)
 
+        playerLooper?.disableLooping()
+        playerLooper = nil
+        player.removeAllItems()
         let item = AVPlayerItem(url: url)
         item.audioTimePitchAlgorithm = .timeDomain
-        player.replaceCurrentItem(with: item)
-        player.play()
-        player.rate = rate
-
-        endObserver = NotificationCenter.default.addObserver(
-            forName: AVPlayerItem.didPlayToEndTimeNotification,
-            object: item, queue: .main) { [weak self] _ in
-                Task { @MainActor in
-                    guard let self else { return }
-                    if loop {
-                        self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
-                        self.player.play()
-                        self.player.rate = rate
-                    } else {
-                        self.returnToIdle()
-                    }
+        if loop {
+            // AVPlayerLooper 提前排队下一轮，避免 seek 回零时的空帧闪烁。
+            playerLooper = AVPlayerLooper(player: player, templateItem: item)
+        } else {
+            player.insert(item, after: nil)
+            endObserver = NotificationCenter.default.addObserver(
+                forName: AVPlayerItem.didPlayToEndTimeNotification,
+                object: item, queue: .main) { [weak self] _ in
+                    Task { @MainActor in self?.returnToIdle() }
                 }
-            }
+        }
+        player.playImmediately(atRate: rate)
+    }
+
+    var renderDiagnostics: [String: Any] {
+        refreshHitPixels()
+        let windows = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(windowNumber)) as? [[String: Any]]
+        let server = windows?.first?[kCGWindowBounds as String] as? [String: Any]
+        let serverW = (server?["Width"] as? NSNumber)?.doubleValue ?? 0
+        let serverH = (server?["Height"] as? NSNumber)?.doubleValue ?? 0
+        return ["serverMatchesFrame": abs(serverW - frame.width) < 1 && abs(serverH - frame.height) < 1,
+         "serverWindowWidth": serverW, "serverWindowHeight": serverH,
+         "loopCount": playerLooper?.loopCount ?? 0,
+         "canvasInsideWindow": contentView?.bounds.contains(videoHost.frame) ?? false,
+         "windowFullyOnScreen": screen?.visibleFrame.contains(frame) ?? false,
+         "canvasWidth": videoHost.frame.width, "canvasHeight": videoHost.frame.height,
+         "transparentCornerPassesThrough": !isVisiblePixel(at: NSPoint(x: 1, y: 1)),
+         "hasHitPixels": hitPixelBuffer != nil,
+         "centerReceivesMouse": isVisiblePixel(at: NSPoint(x: bodySize.width / 2,
+                                                          y: 164 * CGFloat(prefs.petScale))),
+         "state": state, "rate": player.rate, "timeControlStatus": player.timeControlStatus.rawValue,
+         "readyForDisplay": playerLayer.isReadyForDisplay,
+         "itemStatus": player.currentItem?.status.rawValue ?? -1,
+         "time": player.currentTime().seconds,
+         "backingScale": backingScaleFactor,
+         "layerScale": playerLayer.contentsScale,
+         "videoWidth": player.currentItem?.presentationSize.width ?? 0,
+         "videoHeight": player.currentItem?.presentationSize.height ?? 0,
+         "looperStatus": playerLooper?.status.rawValue ?? -1,
+         "error": player.currentItem?.error?.localizedDescription ?? ""]
     }
 
     func playIdle() {
@@ -245,6 +336,8 @@ final class PetWindow: NSWindow {
     // MARK: - 鼠标交互
 
     override func mouseDown(with event: NSEvent) {
+        pointerIsDown = true
+        ignoresMouseEvents = false
         stopPhysics()
         mouseDownScreen = NSEvent.mouseLocation
         windowOriginAtDown = frame.origin
@@ -259,10 +352,9 @@ final class PetWindow: NSWindow {
         let dy = now.y - mouseDownScreen.y
         if abs(dx) > 3 || abs(dy) > 3 { didDrag = true }
         var origin = NSPoint(x: windowOriginAtDown.x + dx, y: windowOriginAtDown.y + dy)
-        // 允许拖出屏幕一部分，但不能完全飞走
-        if let scr = screen?.visibleFrame {
-            origin.x = min(max(origin.x, scr.minX - frame.width * 0.5), scr.maxX - frame.width * 0.5)
-            origin.y = min(max(origin.y, scr.minY - 10), scr.maxY - frame.height * 0.4)
+        // 拖动时也保留完整动画画布，不能把角色或道具拖到屏幕外。
+        if let target = NSScreen.screens.first(where: { $0.frame.contains(now) }) ?? screen {
+            origin = constrainedOrigin(origin, on: target)
         }
         setFrameOrigin(origin)
         lastDragSamples.append((CACurrentMediaTime(), NSEvent.mouseLocation))
@@ -270,6 +362,7 @@ final class PetWindow: NSWindow {
     }
 
     override func mouseUp(with event: NSEvent) {
+        pointerIsDown = false
         if didDrag {
             launchIfThrown()
         } else if let cb = onClicked {
@@ -370,7 +463,11 @@ final class PetWindow: NSWindow {
         if let x = prefs.lastPositionX, let y = prefs.lastPositionY {
             let p = NSPoint(x: x, y: y)
             let visible = NSScreen.screens.contains { $0.visibleFrame.insetBy(dx: -40, dy: -40).contains(p) }
-            if visible { setFrameOrigin(p); return }
+            if visible {
+                setFrameOrigin(p)
+                keepFullyOnScreen()
+                return
+            }
         }
         placeAtDefaultPosition()
     }
@@ -378,7 +475,7 @@ final class PetWindow: NSWindow {
     func placeAtDefaultPosition() {
         guard let scr = screen ?? NSScreen.main else { return }
         let f = scr.visibleFrame
-        setFrameOrigin(NSPoint(x: f.maxX - frame.width - 60, y: f.minY + 20))
+        setFrameOrigin(constrainedOrigin(NSPoint(x: f.maxX - frame.width - 60, y: f.minY + 20), on: scr))
     }
 
     /// 气泡锚点（窗口顶部中心，屏幕坐标）

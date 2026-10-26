@@ -46,9 +46,14 @@ struct Preferences: Codable {
     var lastPositionY: Double? = nil
 
     static let storePath: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory,
-                                            in: .userDomainMask).first!
-        let dir = base.appendingPathComponent("LuckyPet", isDirectory: true)
+        let dir: URL
+        if let override = ProcessInfo.processInfo.environment["LUCKY_PET_CONFIG_DIR"] {
+            dir = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                in: .userDomainMask).first!
+            dir = base.appendingPathComponent("LuckyPet", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("config.json")
     }()
