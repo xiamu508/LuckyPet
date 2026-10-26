@@ -6,6 +6,7 @@
 dist/
 LuckyPet
 *.app
+LuckyPet.zip
 
 # 动画素材（由 scripts/ 获取与生成，不入库）
 assets_raw/
