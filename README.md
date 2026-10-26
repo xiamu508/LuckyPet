@@ -55,7 +55,7 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 
 ### 方式一：下载打包好的应用
 
-从 Releases 下载 `LuckyPet.zip`，解压后拖到「应用程序」文件夹。
+从 [Releases](https://github.com/xiamu508/LuckyPet/releases) 下载 `LuckyPet.zip`，解压后拖到「应用程序」文件夹。
 
 首次打开需 **右键 → 打开**（本项目使用 ad-hoc 签名，未做 Apple 公证）。
 
@@ -64,7 +64,7 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 需要 Xcode 命令行工具（Swift 6+）与 ffmpeg。
 
 ```bash
-git clone https://github.com/<your-name>/LuckyPet.git
+git clone https://github.com/xiamu508/LuckyPet.git
 cd LuckyPet
 
 # 1. 下载动画素材（约 52MB，来自上游 MIT 项目）
