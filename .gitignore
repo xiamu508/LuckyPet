@@ -14,6 +14,7 @@ Assets/
 # 图标中间产物（保留 gen_icon.swift 与 icon_1024.png）
 icon_work/*.iconset/
 icon_work/gen_icon
+icon_work/gen_shot
 icon_work/char*.png
 
 # 脚本运行状态
