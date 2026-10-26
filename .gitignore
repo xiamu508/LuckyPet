@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+*.log
+
+# 构建产物
+dist/
+LuckyPet
+*.app
+
+# 动画素材（由 scripts/ 获取与生成，不入库）
+assets_raw/
+Assets/
+
+# 图标中间产物（保留 gen_icon.swift 与 icon_1024.png）
+icon_work/*.iconset/
+icon_work/gen_icon
+icon_work/char*.png
+
+# 脚本运行状态
+.hd_state.json
+
+# 上游参考代码副本（仅本地阅读，不入库）
+ref/
