@@ -103,6 +103,9 @@ python3 scripts/download_model.py
 产物：`dist/LuckyPet.app`。模型、Python 环境和原始素材不会打进应用。
 `Assets/hd_manifest.json` 记录源文件/成品哈希、分辨率、帧率、帧数及模型版本，重跑会校验后续传。
 
+完整的高清重建说明——断点续跑、实测耗时、CPU/MPS 差异与常见问题——见
+[docs/UPSCALE.md](docs/UPSCALE.md)。
+
 ## 本次画质与窗口修复
 
 原始动画为 **640×360 VP9 with Alpha**，并非无透明通道的黑底素材。旧管线以 FFmpeg 默认 VP9
@@ -175,6 +178,7 @@ LuckyPet/
 │   ├── upscale_hd.py         历史管线：2× 超采样（保留兼容）
 │   └── assets_manifest.json  素材清单（109 个文件）
 ├── icon_work/gen_icon.swift  应用图标生成脚本
+├── docs/UPSCALE.md           从旧素材本地重建 2K 的操作说明
 ├── build.sh                  一键构建
 ├── Info.plist
 ├── LICENSE                   MIT（仅覆盖源代码）
