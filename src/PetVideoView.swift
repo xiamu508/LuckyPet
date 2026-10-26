@@ -5,18 +5,24 @@ import AVFoundation
 @MainActor
 final class PetVideoView: NSView {
     let playerLayer = AVPlayerLayer()
+    /// 过渡层：在动作结束、切回待机时先解码新画面，再与旧画面交叉淡化，避免替换 AVPlayerItem 时露出空帧。
+    let transitionPlayerLayer = AVPlayerLayer()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.masksToBounds = false
-        playerLayer.backgroundColor = NSColor.clear.cgColor
-        playerLayer.isOpaque = false
-        playerLayer.videoGravity = .resizeAspect
-        playerLayer.minificationFilter = .trilinear
-        playerLayer.magnificationFilter = .linear
+        for videoLayer in [playerLayer, transitionPlayerLayer] {
+            videoLayer.backgroundColor = NSColor.clear.cgColor
+            videoLayer.isOpaque = false
+            videoLayer.videoGravity = .resizeAspect
+            videoLayer.minificationFilter = .trilinear
+            videoLayer.magnificationFilter = .linear
+            videoLayer.opacity = 0
+        }
         layer?.addSublayer(playerLayer)
+        layer?.addSublayer(transitionPlayerLayer)
         updateBackingScale()
     }
 
@@ -38,6 +44,7 @@ final class PetVideoView: NSView {
         CATransaction.setDisableActions(true)
         layer?.contentsScale = scale
         playerLayer.contentsScale = scale
+        transitionPlayerLayer.contentsScale = scale
         CATransaction.commit()
     }
 }

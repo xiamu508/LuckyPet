@@ -194,6 +194,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func screenChanged() {
         guard let pet else { return }
+        if pet.isEdgeHidden {
+            pet.keepFullyOnScreen()
+            return
+        }
         if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(pet.frame) }) {
             pet.keepFullyOnScreen()
         } else {
@@ -378,6 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pet.hideBubble()
         } else {
             pet.orderFrontRegardless()
+            pet.revealFromEdge(animated: true)
             pet.playIdle()
         }
     }
@@ -479,7 +484,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         idleTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.hidePet,
+                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.pet.isEdgeHidden, !self.hidePet,
                    self.prefs.randomActionsEnabled {
                     self.pet.playRandom()
                 }
