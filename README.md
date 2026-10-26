@@ -18,7 +18,7 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 
 和常见的桌宠实现不同，本项目**不是**打包 Electron 或 Python 运行时，而是用 Swift + AppKit
 直接写成原生 `.app`：透明无边框窗口、AVFoundation 硬件解码带 Alpha 通道的 HEVC 动画、
-自绘气泡、菜单栏常驻。安装体积 154MB，其中 153MB 是动画素材。
+自绘气泡、菜单栏常驻。安装体积 344MB，其中 343MB 是动画素材。
 
 提醒功能是本项目相对原版桌宠的主要增补：固定间隔循环、可编辑文案池、
 午休/夜间免打扰、临时暂停、今日计数。
@@ -61,7 +61,7 @@ Swift / AppKit 实现 · 无 Python 运行时 · 106 段透明动画 · 全程�
 
 ### 方式二：从源码构建
 
-需要 Xcode 命令行工具（Swift 6+）与 ffmpeg。
+需要 Xcode 命令行工具（Swift 6+）、ffmpeg 与 numpy（`pip install numpy`）。
 
 ```bash
 git clone https://github.com/xiamu508/LuckyPet.git
@@ -70,15 +70,15 @@ cd LuckyPet
 # 1. 下载动画素材（约 52MB，来自上游 MIT 项目）
 python3 scripts/fetch_assets.py
 
-# 2. 转码：黑底 WebM → 带 Alpha 的 HEVC（640×360）
-python3 scripts/transcode.py
+# 2. 抠图 + 转码：黑底 WebM → 颜色反混合 → 带 Alpha 的 HEVC（1280×720）
+python3 scripts/rematte.py --src assets_raw --dst Assets/clips
 
-# 3.（可选）2× 超采样到 1280×720，Retina 下更锐利
-python3 scripts/upscale_hd.py
-
-# 4. 构建 .app
+# 3. 构建 .app
 ./build.sh
 ```
+
+> `scripts/transcode.py` 与 `scripts/upscale_hd.py` 是旧管线（`colorkey` 直接出 alpha），
+> 边缘会残留黑边，仅为兼容保留；新管线用 `rematte.py`。
 
 产物：`dist/LuckyPet.app`
 
@@ -87,13 +87,29 @@ python3 scripts/upscale_hd.py
 
 ## 关于清晰度
 
-桌面显示时桌宠宽约 216pt，Retina 屏需要约 432 物理像素。
+素材上限是上游的 **640×360**，角色在画面中实际只占 **213×271 px**。显示时的对应关系：
 
-- 上游素材为 **640×360**，属于「放大 1.4 倍」，边缘偏软
-- 本项目做 **2× 超采样到 1280×720** 后，变成「缩小 0.7 倍」，边缘明显锐利
+| `petScale` | 角色显示宽度 | 物理像素（2× 屏） | 相对源素材 |
+|---|---|---|---|
+| 0.45 | 约 96pt | 约 192px | 缩小，有余量 |
+| 0.70（默认） | 约 149pt | 约 298px | 放大 1.4× |
+| 1.00 | 约 213pt | 约 426px | 接近 1:1 |
 
-需要说明的是：**超采样不会凭空产生细节**，本质是超采样抗锯齿。开源生态内该角色的
-动画素材上限就是 640×360，若需要更高清晰度只能重绘或使用 AI 超分模型。
+1280×720 素材属于 **2× 超采样**，本质是超采样抗锯齿，**不会凭空产生细节**。
+
+影响观感的**主要因素其实是抠图质量，不是分辨率**：
+
+- 旧管线用 `ffmpeg colorkey` 出 alpha，边缘像素的 RGB 仍是被黑底压暗的混合值
+  （`C = α·F`），播放端再按 straight alpha 合成一次 → 角色被描上一圈断续黑边。
+  实测边缘色差均值 **78.5**，57–63% 的边缘像素偏暗，全库 106 段一致。
+- `scripts/rematte.py` 改为**颜色反混合**：先由纯黑背景得到确定前景（core），
+  用邻域 core 色估计真实颜色 `F`，`alpha = max_c(C/F)`，边缘输出 `F` 而非观测值。
+  色差降至 ~60，暗边基本消失，帧间边缘抖动从 **53.7% → 13.2%**（更稳定，不闪）。
+- 顺带把编码从 `q:v 42 / alpha_quality 0.50` 提到 `q:v 62 / 0.85`，块效应与 alpha
+  阶梯同时改善。代价是码率从约 1.1 Mbps 升到 2.2–2.5 Mbps，素材 153MB → 343MB。
+
+仍然存在的硬限制：源素材角色仅 213×271 px，`petScale > 0.7` 时属于放大显示，
+边缘会偏软。要真正提升只有两条路 —— AI 超分，或重绘/重建模。
 
 ## 配置
 
@@ -127,8 +143,9 @@ LuckyPet/
 │   └── Preferences.swift     配置模型与持久化
 ├── scripts/
 │   ├── fetch_assets.py       从上游下载素材（MIT）
-│   ├── transcode.py          黑底抠图 + HEVC Alpha 编码
-│   ├── upscale_hd.py         2× 超采样（可选）
+│   ├── rematte.py            颜色反混合抠图 + HEVC Alpha 编码（当前管线）
+│   ├── transcode.py          旧管线：colorkey 抠图（保留兼容）
+│   ├── upscale_hd.py         旧管线：2× 超采样（保留兼容）
 │   └── assets_manifest.json  素材清单（109 个文件）
 ├── icon_work/gen_icon.swift  应用图标生成脚本
 ├── build.sh                  一键构建
