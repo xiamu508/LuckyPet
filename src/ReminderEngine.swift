@@ -72,8 +72,7 @@ final class ReminderEngine {
         if elapsed >= intervalSeconds {
             elapsed = 0
             todayCount += 1
-            let text = prefs.reminderMessages.randomElement() ?? "该起来活动一下啦喵～"
-            onFire?(text)
+            onFire?(pickMessage())
         }
     }
 
@@ -81,8 +80,16 @@ final class ReminderEngine {
     func fireNow() {
         rolloverDayIfNeeded()
         todayCount += 1
-        let text = prefs.reminderMessages.randomElement() ?? "该起来活动一下啦喵～"
-        onFire?(text)
+        onFire?(pickMessage())
+    }
+
+    /// 每行是一条候选提醒；兼容旧配置中多条文案被存进同一个数组项的情况。
+    private func pickMessage() -> String {
+        let messages = prefs.reminderMessages
+            .flatMap { $0.components(separatedBy: .newlines) }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return messages.randomElement() ?? "该起来活动一下啦喵～"
     }
 
     /// 重新开始本次计时

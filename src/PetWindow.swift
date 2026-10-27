@@ -31,9 +31,10 @@ final class PetWindow: NSWindow {
     static let sourceWidth: CGFloat = 640
     static let sourceHeight: CGFloat = 360
     static let bubbleWidth: CGFloat = 308
-    /// 顶部常驻气泡区高度（窗口固定高度，避免动态 resize 不提交到 WindowServer）
-    static let bubbleArea: CGFloat = 96
-    static let bubbleAreaTail: CGFloat = 9
+    /// 扩大透明播放窗口，预留多行提醒空间；气泡本身仍紧邻角色头顶。
+    static let bubbleArea: CGFloat = 280
+    private static let bubbleGap: CGFloat = 10
+    private static let bubbleMargin: CGFloat = 12
 
     private let videoHost = PetVideoView(frame: .zero)
     private lazy var playbackSlots: [PlaybackSlot] = [
@@ -49,8 +50,6 @@ final class PetWindow: NSWindow {
     private var currentURL: URL? { activeSlot.url }
     private var currentLoop: Bool { activeSlot.loop }
     private var currentRate: Float { activeSlot.rate }
-    private let cardLayer = CALayer()
-    private let textLayer = CATextLayer()
     private var transitionTimer: Timer?
     private var transitionStartedAt: CFTimeInterval?
     private var transitionTargetIndex: Int?
@@ -85,9 +84,34 @@ final class PetWindow: NSWindow {
     // 气泡（内嵌于本窗口，避免多窗口合成问题）
     private var bubbleOverlay: BubbleOverlayView?
     private var bubbleHeight: CGFloat = 0
+    private var bubbleText: String?
+    private var bubbleEmphasized = false
     private var bubbleHideTimer: Timer?
 
+    // 提醒动效：临时改变窗口几何，不改写用户保存的 petScale 和位置。
+    private enum ReminderPhase {
+        case intro
+        case playing
+        case outro
+    }
+
+    private var reminderDisplayScale: CGFloat?
+    private var reminderAnimationTimer: Timer?
+    private var reminderPhase: ReminderPhase?
+    private var reminderAnimationStartedAt: CFTimeInterval?
+    private var reminderAnimationStartFrame: NSRect?
+    private var reminderAnimationStartScale: CGFloat?
+    private var reminderAnimationFinished = false
+    private var reminderOriginalFrame: NSRect?
+    private var reminderOriginalBodyCenter: NSPoint?
+    private var reminderOriginalScale: CGFloat?
+    private var reminderTargetFrame: NSRect?
+    private var reminderTargetScale: CGFloat = 0
+
+    private var displayScale: CGFloat { reminderDisplayScale ?? CGFloat(prefs.petScale) }
+
     var isBubbleVisible: Bool { bubbleHeight > 0 }
+    var isReminderActive: Bool { reminderOriginalFrame != nil }
 
     // 回调
     var onClicked: ((NSPoint) -> Void)?
@@ -95,13 +119,13 @@ final class PetWindow: NSWindow {
     var onStateChanged: ((String) -> Void)?
 
     var bodySize: NSSize {
-        NSSize(width: Self.sourceWidth * prefs.petScale,
-               height: Self.sourceHeight * prefs.petScale)
+        NSSize(width: Self.sourceWidth * displayScale,
+               height: Self.sourceHeight * displayScale)
     }
 
     /// 放置位置以待机轮廓为准，允许画布中的透明留白越过屏幕边缘。
     var visiblePetFrame: NSRect {
-        let s = CGFloat(prefs.petScale)
+        let s = displayScale
         return NSRect(x: frame.minX + restingSourceBounds.minX * s,
                       y: frame.minY + restingSourceBounds.minY * s,
                       width: restingSourceBounds.width * s, height: restingSourceBounds.height * s)
@@ -179,9 +203,7 @@ final class PetWindow: NSWindow {
         container.addSubview(videoHost)
         contentView = container
 
-        let bubbleW = Self.bubbleWidth * prefs.petScale
-        let ov = BubbleOverlayView(frame: NSRect(x: (w - bubbleW) / 2, y: Self.sourceHeight * prefs.petScale,
-                                                 width: bubbleW, height: Self.bubbleArea))
+        let ov = BubbleOverlayView(frame: .zero)
         container.addSubview(ov)
         bubbleOverlay = ov
 
@@ -199,23 +221,42 @@ final class PetWindow: NSWindow {
 
     // MARK: - 几何
 
-    /// 窗口容纳完整 640×360 动画画布，头顶另留气泡区；不裁剪动作和特效。
-    func applyGeometry() {
-        let s = CGFloat(prefs.petScale)
-        let canvasW = Self.sourceWidth * s
-        let canvasH = Self.sourceHeight * s
-        let totalH = canvasH + Self.bubbleArea
-        let origin = NSPoint(x: frame.midX - canvasW / 2, y: frame.minY)
-        setFrame(NSRect(origin: origin, size: NSSize(width: canvasW, height: totalH)), display: true)
+    private func frameSize(for scale: CGFloat) -> NSSize {
+        NSSize(width: Self.sourceWidth * scale,
+               height: Self.sourceHeight * scale + Self.bubbleArea)
+    }
+
+    /// 以角色轮廓中心为锚点计算窗口位置，并保证整个窗口仍落在屏幕可见区域内。
+    private func frameOrigin(for scale: CGFloat, bodyCenter: NSPoint, on screen: NSScreen) -> NSPoint {
+        let size = frameSize(for: scale)
+        let visible = screen.visibleFrame
+        let desired = NSPoint(x: bodyCenter.x - restingSourceBounds.midX * scale,
+                               y: bodyCenter.y - restingSourceBounds.midY * scale)
+        let maxX = max(visible.minX, visible.maxX - size.width)
+        let maxY = max(visible.minY, visible.maxY - size.height)
+        return NSPoint(x: min(max(desired.x, visible.minX), maxX),
+                       y: min(max(desired.y, visible.minY), maxY))
+    }
+
+    private func setWindowGeometry(frame targetFrame: NSRect, scale: CGFloat) {
+        setFrame(targetFrame, display: true)
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layoutVideoLayers(canvasW: canvasW, canvasH: canvasH)
+        layoutVideoLayers(canvasW: Self.sourceWidth * scale,
+                          canvasH: Self.sourceHeight * scale)
         CATransaction.commit()
-        let bubbleW = Self.bubbleWidth * s
-        bubbleOverlay?.frame = NSRect(x: (canvasW - bubbleW) / 2, y: canvasH,
-                                      width: bubbleW, height: Self.bubbleArea)
-        if isVisible { keepFullyOnScreen() }
+
+        if isBubbleVisible { layoutBubble() }
+    }
+
+    /// 窗口容纳完整 640×360 动画画布，头顶另留气泡区；不裁剪动作和特效。
+    func applyGeometry() {
+        let s = displayScale
+        let size = frameSize(for: s)
+        let origin = NSPoint(x: frame.midX - size.width / 2, y: frame.minY)
+        setWindowGeometry(frame: NSRect(origin: origin, size: size), scale: s)
+        if isVisible && !isReminderActive { keepFullyOnScreen() }
     }
 
     private func layoutVideoLayers(canvasW: CGFloat, canvasH: CGFloat) {
@@ -247,7 +288,7 @@ final class PetWindow: NSWindow {
         guard videoHost.frame.contains(point) else { return false }
         guard let pixel = hitPixelBuffer else {
             // 解码器尚未输出首帧时，只允许角色中心区域交互。
-            let s = CGFloat(prefs.petScale)
+            let s = displayScale
             return NSRect(x: (Self.sourceWidth - 240) * s / 2, y: 20 * s,
                           width: 240 * s, height: 300 * s).contains(point)
         }
@@ -266,6 +307,7 @@ final class PetWindow: NSWindow {
         guard isVisible else { ignoresMouseEvents = true; return }
         if playbackSlots[hitSlotIndex].player.currentItem !== hitOutputItem { refreshHitPixels() }
         guard !isRenderTest else { ignoresMouseEvents = true; return }
+        guard !isReminderActive else { ignoresMouseEvents = true; return }
         guard !pointerIsDown else { ignoresMouseEvents = false; return }
         let point = mouseLocationOutsideOfEventStream
         guard contentView?.bounds.contains(point) == true else { ignoresMouseEvents = true; return }
@@ -283,6 +325,7 @@ final class PetWindow: NSWindow {
     }
 
     func keepFullyOnScreen() {
+        guard !isReminderActive else { return }
         guard let target = placementScreen else { return }
         let visible = target.visibleFrame
         if frame.width > visible.width || frame.height > visible.height {
@@ -299,39 +342,41 @@ final class PetWindow: NSWindow {
     }
 
     private func layoutBubble() {
-        guard let overlay = bubbleOverlay, let screen = placementScreen, let content = contentView else { return }
+        guard let overlay = bubbleOverlay, let text = bubbleText,
+              let screen = placementScreen, let content = contentView else { return }
         let visible = screen.visibleFrame.offsetBy(dx: -frame.minX, dy: -frame.minY).intersection(content.bounds)
-        guard !visible.isEmpty else { return }
-        let width = Self.bubbleWidth * CGFloat(prefs.petScale)
-        let normalX = (bodySize.width - width) / 2
-        let x = min(max(normalX, visible.minX), max(visible.minX, visible.maxX - width))
-        let y = min(max(bodySize.height, visible.minY), max(visible.minY, visible.maxY - Self.bubbleArea))
-        overlay.frame = NSRect(x: x, y: y, width: width, height: Self.bubbleArea)
+        guard visible.width > Self.bubbleMargin * 2, visible.height > Self.bubbleMargin * 2 else { return }
+        let available = visible.insetBy(dx: Self.bubbleMargin, dy: Self.bubbleMargin)
+        // 小桌宠也保留可读宽度，避免字体不变而气泡越缩越窄。
+        var width = min(max(260, Self.bubbleWidth * displayScale), available.width)
+        var height = overlay.update(text: text, emphasized: bubbleEmphasized, cardWidth: width)
+        if height > available.height, width < available.width {
+            width = available.width
+            height = overlay.update(text: text, emphasized: bubbleEmphasized, cardWidth: width)
+        }
+        let body = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
+        let normalX = body.midX - width / 2
+        let x = min(max(normalX, available.minX), max(available.minX, available.maxX - width))
+        let above = body.maxY + Self.bubbleGap
+        let below = body.minY - Self.bubbleGap - height
+        let preferredY = above + height <= available.maxY ? above :
+            (below >= available.minY ? below : available.maxY - height)
+        let y = min(max(preferredY, available.minY), max(available.minY, available.maxY - height))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        overlay.frame = NSRect(x: x, y: y, width: width, height: height)
+        CATransaction.commit()
+        bubbleHeight = height
     }
 
     // MARK: - 气泡
 
     func showBubble(text: String, duration: TimeInterval, emphasize: Bool = false) {
-        keepFullyOnScreen()
+        if !isReminderActive { keepFullyOnScreen() }
         bubbleHideTimer?.invalidate()
-        let s = CGFloat(prefs.petScale)
-        let roleW = Self.bubbleWidth * s
-        let roleH = Self.sourceHeight * s
-        let bubbleX = (Self.sourceWidth * s - roleW) / 2
-
-        if bubbleOverlay == nil {
-            let v = BubbleOverlayView(frame: NSRect(x: bubbleX, y: roleH, width: roleW, height: Self.bubbleArea))
-            contentView?.addSubview(v)
-            bubbleOverlay = v
-        }
-        guard let overlay = bubbleOverlay else { return }
-        overlay.frame = NSRect(x: bubbleX, y: roleH, width: roleW, height: Self.bubbleArea)
+        bubbleText = text
+        bubbleEmphasized = emphasize
         layoutBubble()
-        overlay.restoreBackground()
-        let cardH = overlay.update(text: text, emphasized: emphasize, cardWidth: roleW)
-        bubbleHeight = cardH
-        overlay.needsDisplay = true
-
         bubbleHideTimer = Timer.scheduledTimer(withTimeInterval: max(duration, 2.0), repeats: false) { [weak self] _ in
             Task { @MainActor in self?.hideBubble() }
         }
@@ -340,12 +385,13 @@ final class PetWindow: NSWindow {
     func hideBubble() {
         bubbleHideTimer?.invalidate()
         bubbleHideTimer = nil
-        guard bubbleHeight > 0 else { return }
+        bubbleText = nil
         bubbleHeight = 0
         bubbleOverlay?.clear()
     }
 
     func applyScale(_ scale: Double) {
+        guard !isReminderActive else { return }
         let visible = placementScreen?.visibleFrame
         let maxScale = visible.map { min($0.width / Self.sourceWidth, ($0.height - Self.bubbleArea) / Self.sourceHeight) } ?? 1.0
         let requested = min(max(scale, 0.25), maxScale)
@@ -360,6 +406,213 @@ final class PetWindow: NSWindow {
         prefs.alwaysOnTop = on
         level = on ? .statusBar : .normal
         prefs.save()
+    }
+
+    // MARK: - 提醒动效
+
+    /// 播放提醒回应，并把桌宠临时放大、移动到当前屏幕中央；提醒结束后恢复原位置。
+    func showReminder(text: String, duration: TimeInterval) {
+        stopPhysics()
+        pointerIsDown = false
+        lastDragSamples.removeAll()
+
+        if isReminderActive {
+            reminderAnimationFinished = false
+            showBubble(text: text, duration: duration, emphasize: true)
+            reminderAnimationStartFrame = frame
+            reminderAnimationStartScale = displayScale
+            reminderAnimationStartedAt = CACurrentMediaTime()
+            reminderPhase = .intro
+            playReminderAnimation()
+            ensureReminderAnimationTimer()
+            return
+        }
+
+        // 原位置先做一次普通的屏幕约束，确保返回动画有一个可靠终点。
+        keepFullyOnScreen()
+        guard let screen = placementScreen ?? NSScreen.main else {
+            showBubble(text: text, duration: duration, emphasize: true)
+            return
+        }
+
+        let originalFrame = frame
+        let originalScale = displayScale
+        let originalBodyCenter = NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.midY)
+        let visible = screen.visibleFrame
+        let fitScale = min(visible.width / Self.sourceWidth,
+                           max(0, visible.height - Self.bubbleArea) / Self.sourceHeight)
+        let targetScale = min(max(originalScale * 1.34, originalScale + 0.18), fitScale)
+        let targetOrigin = frameOrigin(for: targetScale,
+                                       bodyCenter: NSPoint(x: visible.midX, y: visible.midY),
+                                       on: screen)
+        let targetFrame = NSRect(origin: targetOrigin, size: frameSize(for: targetScale))
+
+        reminderOriginalFrame = originalFrame
+        reminderOriginalBodyCenter = originalBodyCenter
+        reminderOriginalScale = originalScale
+        reminderTargetFrame = targetFrame
+        reminderTargetScale = targetScale
+        reminderDisplayScale = originalScale
+        reminderAnimationFinished = false
+        reminderAnimationStartFrame = originalFrame
+        reminderAnimationStartScale = originalScale
+        reminderAnimationStartedAt = CACurrentMediaTime()
+        reminderPhase = .intro
+
+        showBubble(text: text, duration: duration, emphasize: true)
+        playReminderAnimation()
+        ensureReminderAnimationTimer()
+    }
+
+    private func playReminderAnimation() {
+        guard let url = library.random.pick(excluding: currentURL) else {
+            reminderAnimationFinished = true
+            startReminderOutroIfReady()
+            return
+        }
+        play(url: url, loop: false, rate: 1.0, state: "reminder") { [weak self] in
+            guard let self else { return }
+            self.reminderAnimationFinished = true
+            self.startReminderOutroIfReady()
+        }
+    }
+
+    private func ensureReminderAnimationTimer() {
+        guard reminderAnimationTimer == nil else { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.advanceReminderAnimation() }
+        }
+        reminderAnimationTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func advanceReminderAnimation() {
+        guard isReminderActive,
+              let phase = reminderPhase,
+              let targetFrame = reminderTargetFrame,
+              let originalFrame = reminderOriginalFrame,
+              let originalScale = reminderOriginalScale else {
+            finishReminder()
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        switch phase {
+        case .intro:
+            guard let startedAt = reminderAnimationStartedAt,
+                  let startFrame = reminderAnimationStartFrame,
+                  let startScale = reminderAnimationStartScale else {
+                finishReminder()
+                return
+            }
+            let raw = min(max((now - startedAt) / 0.55, 0), 1)
+            let eased = reminderIntroEase(CGFloat(raw))
+            let scale = startScale + (reminderTargetScale - startScale) * eased
+            let origin = interpolate(startFrame.origin, targetFrame.origin, eased)
+            setReminderGeometry(scale: scale, origin: origin)
+            if raw >= 1 {
+                setReminderGeometry(scale: reminderTargetScale, origin: targetFrame.origin)
+                reminderPhase = .playing
+                startReminderOutroIfReady()
+            }
+
+        case .playing:
+            return
+
+        case .outro:
+            guard let startedAt = reminderAnimationStartedAt else {
+                finishReminder()
+                return
+            }
+            let raw = min(max((now - startedAt) / 0.55, 0), 1)
+            let eased = reminderEaseInOut(CGFloat(raw))
+            let scale = reminderTargetScale + (originalScale - reminderTargetScale) * eased
+            let origin = interpolate(targetFrame.origin, originalFrame.origin, eased)
+            setReminderGeometry(scale: scale, origin: origin)
+            if raw >= 1 { finishReminder() }
+        }
+    }
+
+    private func startReminderOutroIfReady() {
+        guard reminderPhase == .playing,
+              reminderAnimationFinished,
+              let targetFrame = reminderTargetFrame else { return }
+        reminderPhase = .outro
+        reminderAnimationStartedAt = CACurrentMediaTime()
+        reminderAnimationStartFrame = targetFrame
+        reminderAnimationStartScale = reminderTargetScale
+    }
+
+    private func setReminderGeometry(scale: CGFloat, origin: NSPoint) {
+        reminderDisplayScale = scale
+        setWindowGeometry(frame: NSRect(origin: origin, size: frameSize(for: scale)), scale: scale)
+    }
+
+    private func interpolate(_ a: NSPoint, _ b: NSPoint, _ progress: CGFloat) -> NSPoint {
+        NSPoint(x: a.x + (b.x - a.x) * progress,
+                y: a.y + (b.y - a.y) * progress)
+    }
+
+    private func reminderIntroEase(_ progress: CGFloat) -> CGFloat {
+        let t = min(max(progress, 0), 1)
+        let inverse = 1 - t
+        let cubic = 1 - inverse * inverse * inverse
+        // 轻微弹性让“跳到中央”的到达感更明显，同时不越过屏幕边界。
+        return min(1, cubic + sin(t * .pi) * 0.03)
+    }
+
+    private func reminderEaseInOut(_ progress: CGFloat) -> CGFloat {
+        let t = min(max(progress, 0), 1)
+        return t * t * (3 - 2 * t)
+    }
+
+    private func finishReminder() {
+        guard let originalFrame = reminderOriginalFrame,
+              let originalBodyCenter = reminderOriginalBodyCenter,
+              let originalScale = reminderOriginalScale else {
+            reminderAnimationTimer?.invalidate()
+            reminderAnimationTimer = nil
+            reminderPhase = nil
+            reminderDisplayScale = nil
+            return
+        }
+
+        reminderAnimationTimer?.invalidate()
+        reminderAnimationTimer = nil
+
+        let requestedScale = CGFloat(prefs.petScale)
+        if abs(requestedScale - originalScale) < 0.001 {
+            reminderDisplayScale = originalScale
+            setWindowGeometry(frame: originalFrame, scale: originalScale)
+        } else {
+            let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(originalBodyCenter) })
+                ?? NSScreen.main
+            if let screen {
+                reminderDisplayScale = requestedScale
+                let origin = frameOrigin(for: requestedScale,
+                                         bodyCenter: originalBodyCenter,
+                                         on: screen)
+                setWindowGeometry(frame: NSRect(origin: origin, size: frameSize(for: requestedScale)),
+                                  scale: requestedScale)
+            } else {
+                reminderDisplayScale = originalScale
+                setWindowGeometry(frame: originalFrame, scale: originalScale)
+            }
+        }
+
+        reminderDisplayScale = nil
+        reminderPhase = nil
+        reminderAnimationStartedAt = nil
+        reminderAnimationStartFrame = nil
+        reminderAnimationStartScale = nil
+        reminderAnimationFinished = false
+        reminderOriginalFrame = nil
+        reminderOriginalBodyCenter = nil
+        reminderOriginalScale = nil
+        reminderTargetFrame = nil
+        reminderTargetScale = 0
+        updatePointerHitTesting()
+        returnToIdle()
     }
 
     // MARK: - 播放
@@ -391,7 +644,8 @@ final class PetWindow: NSWindow {
         if hideLayer { setLayerOpacity(slot.layer, 0) }
     }
 
-    private func prepare(_ slot: PlaybackSlot, url: URL, loop: Bool, rate: Float) {
+    private func prepare(_ slot: PlaybackSlot, url: URL, loop: Bool, rate: Float,
+                         onFinished: (() -> Void)? = nil) {
         reset(slot, hideLayer: false)
         slot.url = url
         slot.loop = loop
@@ -416,7 +670,11 @@ final class PetWindow: NSWindow {
                           self.activeSlotIndex == slotIndex,
                           self.playbackSlots[slotIndex].generation == generation,
                           self.activeSlot.url == url else { return }
-                    self.returnToIdle()
+                    if let onFinished {
+                        onFinished()
+                    } else {
+                        self.returnToIdle()
+                    }
                 }
             }
         }
@@ -502,12 +760,14 @@ final class PetWindow: NSWindow {
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    func play(url: URL, loop: Bool, rate: Float = 1.0, state: String) {
-        if currentURL == url, loop == currentLoop, player.rate > 0, transitionTargetIndex == nil { return }
+    func play(url: URL, loop: Bool, rate: Float = 1.0, state: String,
+              onFinished: (() -> Void)? = nil) {
+        if currentURL == url, loop == currentLoop, player.rate > 0,
+           transitionTargetIndex == nil, onFinished == nil { return }
         cancelTransition()
         reset(inactiveSlot)
         setLayerOpacity(activeSlot.layer, 1)
-        prepare(activeSlot, url: url, loop: loop, rate: rate)
+        prepare(activeSlot, url: url, loop: loop, rate: rate, onFinished: onFinished)
         hitSlotIndex = activeSlotIndex
         self.state = state
         onStateChanged?(state)
@@ -520,6 +780,8 @@ final class PetWindow: NSWindow {
         let serverW = (server?["Width"] as? NSNumber)?.doubleValue ?? 0
         let serverH = (server?["Height"] as? NSNumber)?.doubleValue ?? 0
         let visible = placementScreen?.visibleFrame.insetBy(dx: -1, dy: -1)
+        let serverBounds = NSRect(x: 0, y: 0, width: serverW, height: serverH)
+        let petBounds = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
         let bubbleFrame = bubbleOverlay?.frame.offsetBy(dx: frame.minX, dy: frame.minY) ?? .zero
         return ["serverMatchesFrame": abs(serverW - frame.width) < 1 && abs(serverH - frame.height) < 1,
          "serverWindowWidth": serverW, "serverWindowHeight": serverH,
@@ -528,6 +790,15 @@ final class PetWindow: NSWindow {
          "windowFullyOnScreen": screen?.visibleFrame.contains(frame) ?? false,
          "petFullyOnScreen": visible?.contains(visiblePetFrame) ?? false,
          "bubbleFullyOnScreen": !isBubbleVisible || (visible?.contains(bubbleFrame) ?? false),
+         "bubbleInsideWindow": !isBubbleVisible || (contentView?.bounds.contains(bubbleOverlay?.frame ?? .zero) ?? false),
+         "bubbleInsideServerWindow": !isBubbleVisible || serverBounds.contains(bubbleOverlay?.frame ?? .zero),
+         "petInsideServerWindow": serverBounds.contains(petBounds),
+         "bubbleTextFullyVisible": !isBubbleVisible || (bubbleOverlay?.isTextFullyVisible ?? false),
+         "bubbleGap": isBubbleVisible ? bubbleFrame.minY - visiblePetFrame.maxY : 0,
+         "bubbleWidth": bubbleOverlay?.frame.width ?? 0,
+         "bubbleHeight": bubbleHeight,
+         "displayScale": displayScale,
+         "reminderActive": isReminderActive,
          "bubbleVisible": isBubbleVisible,
          "restingSourceBounds": [restingSourceBounds.minX, restingSourceBounds.minY,
                                  restingSourceBounds.width, restingSourceBounds.height],
@@ -547,6 +818,34 @@ final class PetWindow: NSWindow {
          "looperStatus": activeSlot.looper?.status.rawValue ?? -1,
          "windowVisible": isVisible,
          "error": player.currentItem?.error?.localizedDescription ?? ""]
+    }
+
+    /// 验收预览复用实际视频帧、气泡图层与窗口坐标，不截取桌面或其他应用。
+    func saveRenderPreview(to destination: URL) {
+        let density = backingScaleFactor
+        guard let context = CGContext(data: nil, width: Int(ceil(frame.width * density)),
+                                      height: Int(ceil(frame.height * density)), bitsPerComponent: 8,
+                                      bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return }
+        context.scaleBy(x: density, y: density)
+        context.setFillColor(NSColor(calibratedRed: 0.92, green: 0.88, blue: 0.81, alpha: 1).cgColor)
+        context.fill(CGRect(origin: .zero, size: frame.size))
+        if let url = currentURL {
+            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+            if let image = try? generator.copyCGImage(at: player.currentTime(), actualTime: nil) {
+                context.draw(image, in: videoHost.frame)
+            }
+        }
+        if isBubbleVisible, let overlay = bubbleOverlay {
+            context.saveGState()
+            context.translateBy(x: overlay.frame.minX, y: overlay.frame.minY)
+            overlay.renderPreview(in: context)
+            context.restoreGState()
+        }
+        if let image = context.makeImage(),
+           let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+            try? png.write(to: destination)
+        }
     }
 
     func playIdle(smooth: Bool = false) {
@@ -581,6 +880,7 @@ final class PetWindow: NSWindow {
     // MARK: - 鼠标交互
 
     override func mouseDown(with event: NSEvent) {
+        guard !isReminderActive else { return }
         pointerIsDown = true
         ignoresMouseEvents = false
         stopPhysics()
@@ -592,6 +892,7 @@ final class PetWindow: NSWindow {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard !isReminderActive else { return }
         let now = convertPoint(toScreen: event.locationInWindow)
         let dx = now.x - mouseDownScreen.x
         let dy = now.y - mouseDownScreen.y
@@ -605,6 +906,10 @@ final class PetWindow: NSWindow {
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard !isReminderActive else {
+            pointerIsDown = false
+            return
+        }
         pointerIsDown = false
         if didDrag {
             keepFullyOnScreen()
@@ -618,6 +923,7 @@ final class PetWindow: NSWindow {
     }
 
     override func rightMouseDown(with event: NSEvent) {
+        guard !isReminderActive else { return }
         stopPhysics()
         keepFullyOnScreen()
         returnToIdle()
@@ -727,9 +1033,9 @@ final class PetWindow: NSWindow {
         setFrameOrigin(constrainedOrigin(NSPoint(x: f.maxX - frame.width - 60, y: f.minY + 20), on: scr))
     }
 
-    /// 气泡锚点（窗口顶部中心，屏幕坐标）
+    /// 气泡锚点（角色头顶，屏幕坐标）
     func bubbleAnchor() -> NSPoint {
-        NSPoint(x: frame.midX, y: frame.maxY - 6)
+        NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.maxY + Self.bubbleGap)
     }
 }
 

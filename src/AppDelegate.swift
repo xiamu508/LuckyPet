@@ -66,12 +66,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func runRenderTest(directory: URL) {
         var observations: [[String: Any]] = []
         var releasedOrigins: [String: NSPoint] = [:]
+        let longReminder = "已经坐了好久啦，起来站一会儿嘛喵～（动作：双手扶桌，原地踮脚10次，再慢慢站直）"
+        var selectionPrefs = Preferences()
+        selectionPrefs.reminderMessages = ["第一条提醒\n第二条提醒\r\n第三条提醒", "  "]
+        let selectionEngine = ReminderEngine(prefs: selectionPrefs)
+        var selectedMessages: [String] = []
+        selectionEngine.onFire = { selectedMessages.append($0) }
+        for _ in 0..<20 { selectionEngine.fireNow() }
+        let singleReminderPerFire = selectedMessages.count == 20 && selectedMessages.allSatisfy {
+            ["第一条提醒", "第二条提醒", "第三条提醒"].contains($0)
+        }
+        selectionEngine.prefs.reminderMessages = ["", " \n\r\n "]
+        selectionEngine.fireNow()
+        let blankMessagesUseFallback = selectedMessages.count == 21 &&
+            selectedMessages.last == "该起来活动一下啦喵～"
         func record(_ phase: String) {
             var data = pet.renderDiagnostics
             data["phase"] = phase
             data["positionStable"] = releasedOrigins[phase].map {
                 abs(self.pet.frame.minX - $0.x) < 1 && abs(self.pet.frame.minY - $0.y) < 1
             } ?? true
+            // 连续缩放时 WindowServer 的尺寸可能滞后一帧；仍检查真实窗口完整容纳角色和气泡。
+            data["serverGeometryValid"] = (data["serverMatchesFrame"] as? Bool == true) ||
+                (phase == "reminder-intro" && (data["petInsideServerWindow"] as? Bool == true) &&
+                 (data["bubbleInsideServerWindow"] as? Bool == true))
             data["atRequestedBoundary"] = true
             if phase.hasPrefix("release-") {
                 let body = self.pet.visiblePetFrame
@@ -87,6 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             observations.append(data)
+            if self.pet.isBubbleVisible {
+                self.pet.saveRenderPreview(to: directory.appendingPathComponent("\(phase).png"))
+            }
             NSLog("[RenderTest] %@ %@", phase, String(describing: data))
         }
         func dragAndRelease(at origin: NSPoint) {
@@ -108,9 +129,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var checks: [(Double, () -> Void)] = [
             (1, { record("idle") }),
-            (2, { self.pet.applyScale(0.45) }),
+            (2, {
+                self.pet.applyScale(0.45)
+                if let visible = (self.pet.screen ?? NSScreen.main)?.visibleFrame {
+                    self.pet.setFrameOrigin(NSPoint(x: visible.midX - self.pet.frame.width / 2,
+                                                    y: visible.minY + 40))
+                }
+                self.pet.showBubble(text: longReminder, duration: 10, emphasize: true)
+            }),
             (3, { record("small"); self.pet.applyScale(0.95) }),
-            (4, { record("large"); self.pet.applyScale(0.70) }),
+            (4, { record("large"); self.pet.applyScale(0.35) }),
+            (4.7, { record("bubble-smallest"); self.pet.applyScale(0.25) }),
+            (5.4, { record("bubble-minimum"); self.pet.applyScale(0.70) }),
+            (6, { record("bubble-default"); self.pet.hideBubble() }),
             (12, { record("idle-after-loop") }),
             (13, { self.pet.playClick() }),
             (15, { record("click") }),
@@ -191,10 +222,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             record("restore-edge-position")
         }))
+        checks.append((54, {
+            self.pet.applyScale(0.70)
+            if let visible = (self.pet.screen ?? NSScreen.main)?.visibleFrame {
+                self.pet.setFrameOrigin(NSPoint(x: visible.midX - self.pet.frame.width / 2,
+                                                y: visible.minY + 40))
+            }
+            releasedOrigins["after-reminder"] = self.pet.frame.origin
+            self.pet.showReminder(text: longReminder, duration: 25)
+        }))
+        checks.append((54.2, { record("reminder-intro") }))
+        checks.append((54.8, { record("reminder-centered") }))
+        checks.append((55, {
+            self.pet.showReminder(text: "主人，该站起来活动活动了，人家可不想你腰疼喵。（动作：双手扶桌，原地踮脚10次，慢慢站直后再轻轻伸个懒腰）", duration: 25)
+        }))
+        checks.append((55.8, { record("reminder-repeated") }))
+        checks.append((67, { record("after-reminder") }))
         for (delay, action) in checks {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { action() }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 54) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 68) {
             var expectedStates = ["idle": "idle", "idle-after-loop": "idle", "click": "click",
                                   "return-to-idle": "idle", "drag": "drag", "idle-restored": "idle",
                                   "wide-animation": "wide-animation", "full-canvas-effects": "full-canvas-effects"]
@@ -203,16 +250,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             expectedStates["after-edge-bubble"] = "idle"
             expectedStates["restore-offscreen-position"] = "idle"
             expectedStates["restore-edge-position"] = "idle"
-            let ok = observations.count == 24 && observations.allSatisfy { observation in
+            expectedStates["after-reminder"] = "idle"
+            for phase in ["reminder-intro", "reminder-centered", "reminder-repeated"] {
+                expectedStates[phase] = "reminder"
+            }
+            let headBubblePhases = ["small", "large", "bubble-smallest", "bubble-minimum", "bubble-default",
+                                    "reminder-intro", "reminder-centered", "reminder-repeated", "after-reminder"]
+            let ok = singleReminderPerFire && blankMessagesUseFallback &&
+                observations.count == 31 && observations.allSatisfy { observation in
                 (expectedStates[observation["phase"] as? String ?? ""].map { expected in
                     expected == (observation["state"] as? String)
                 } ?? true) &&
                 ((observation["phase"] as? String != "idle-after-loop") || ((observation["loopCount"] as? Int ?? 0) >= 1)) &&
-                (observation["serverMatchesFrame"] as? Bool == true) &&
+                (observation["serverGeometryValid"] as? Bool == true) &&
+                (observation["petInsideServerWindow"] as? Bool == true) &&
+                (observation["bubbleInsideServerWindow"] as? Bool == true) &&
                 (observation["hasHitPixels"] as? Bool == true) &&
                 (observation["canvasInsideWindow"] as? Bool == true) &&
                 (observation["petFullyOnScreen"] as? Bool == true) &&
                 (observation["bubbleFullyOnScreen"] as? Bool == true) &&
+                (observation["bubbleInsideWindow"] as? Bool == true) &&
+                (observation["bubbleTextFullyVisible"] as? Bool == true) &&
+                (!headBubblePhases.contains(observation["phase"] as? String ?? "") ||
+                 abs((observation["bubbleGap"] as? CGFloat ?? 0) - 10) < 0.5) &&
+                ((observation["phase"] as? String != "after-reminder") ||
+                 (observation["reminderActive"] as? Bool == false)) &&
                 (observation["windowVisible"] as? Bool == true) &&
                 (observation["positionStable"] as? Bool == true) &&
                 (observation["atRequestedBoundary"] as? Bool == true) &&
@@ -230,7 +292,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 ((observation["backingScale"] as? CGFloat) == (observation["layerScale"] as? CGFloat)) &&
                 ((observation["error"] as? String) == "")
             }
-            let report: [String: Any] = ["passed": ok, "observations": observations]
+            let report: [String: Any] = ["passed": ok, "observations": observations,
+                                          "singleReminderPerFire": singleReminderPerFire,
+                                          "blankMessagesUseFallback": blankMessagesUseFallback]
             try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: directory.appendingPathComponent("render-smoke.json"))
@@ -295,6 +359,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func screenChanged() {
         guard let pet else { return }
+        guard !pet.isReminderActive else { return }
         if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(pet.frame) }) {
             pet.keepFullyOnScreen()
         } else {
@@ -447,6 +512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - 菜单动作
 
     @objc private func actionPat() {
+        guard !pet.isReminderActive else { return }
         pet.playClick()
         let text = prefs.clickMessages.randomElement() ?? "喵～"
         pet.showBubble(text: text, duration: 8)
@@ -473,6 +539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func actionToggleVisible() {
+        guard !pet.isReminderActive else { return }
         hidePet.toggle()
         if hidePet {
             pet.orderOut(nil)
@@ -505,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                           self.reminder.prefs = newPrefs
                           if abs(oldScale - newPrefs.petScale) > 0.001 {
                               self.pet.prefs = newPrefs
-                              self.pet.applyGeometry()
+                              if !self.pet.isReminderActive { self.pet.applyGeometry() }
                           }
                           if oldTop != newPrefs.alwaysOnTop {
                               self.pet.applyAlwaysOnTop(newPrefs.alwaysOnTop)
@@ -533,8 +600,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - 提醒投递
 
     private func deliverReminder(_ text: String) {
-        pet.playClick()
-        pet.showBubble(text: text, duration: TimeInterval(prefs.breakSeconds), emphasize: true)
+        pet.showReminder(text: text, duration: TimeInterval(prefs.breakSeconds))
 
         if prefs.playSound {
             NSSound(named: NSSound.Name("Glass"))?.play()
@@ -581,7 +647,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         idleTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.hidePet,
+                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.pet.isReminderActive, !self.hidePet,
                    self.prefs.randomActionsEnabled {
                     self.pet.playRandom()
                 }
