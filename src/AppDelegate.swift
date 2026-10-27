@@ -65,13 +65,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 隔离的原生视频渲染自检；不启动提醒、不请求通知权限。
     private func runRenderTest(directory: URL) {
         var observations: [[String: Any]] = []
+        var releasedOrigins: [String: NSPoint] = [:]
         func record(_ phase: String) {
             var data = pet.renderDiagnostics
             data["phase"] = phase
+            data["positionStable"] = releasedOrigins[phase].map {
+                abs(self.pet.frame.minX - $0.x) < 1 && abs(self.pet.frame.minY - $0.y) < 1
+            } ?? true
+            data["atRequestedBoundary"] = true
+            if phase.hasPrefix("release-") {
+                let body = self.pet.visiblePetFrame
+                let center = NSPoint(x: body.midX, y: body.midY)
+                if let visible = NSScreen.screens.first(where: { $0.frame.contains(center) })?.visibleFrame {
+                    data["atRequestedBoundary"] =
+                        (!phase.contains("left") || abs(body.minX - visible.minX) < 1) &&
+                        (!phase.contains("right") || abs(body.maxX - visible.maxX) < 1) &&
+                        (!phase.contains("top") || abs(body.maxY - visible.maxY) < 1) &&
+                        (!phase.contains("bottom") || abs(body.minY - visible.minY) < 1)
+                } else {
+                    data["atRequestedBoundary"] = false
+                }
+            }
             observations.append(data)
             NSLog("[RenderTest] %@ %@", phase, String(describing: data))
         }
-        let checks: [(Double, () -> Void)] = [
+        func dragAndRelease(at origin: NSPoint) {
+            let start = NSPoint(x: self.pet.frame.midX,
+                                y: self.pet.frame.minY + 164 * CGFloat(self.pet.prefs.petScale))
+            let delta = NSPoint(x: origin.x - self.pet.frame.minX, y: origin.y - self.pet.frame.minY)
+            let end = NSPoint(x: start.x + delta.x, y: start.y + delta.y)
+            let timestamp = ProcessInfo.processInfo.systemUptime
+            let duration = Double(max(abs(delta.x), abs(delta.y))) / 100 + 0.1
+            func event(_ type: NSEvent.EventType, at point: NSPoint, time: Double) -> NSEvent {
+                NSEvent.mouseEvent(with: type, location: self.pet.convertPoint(fromScreen: point),
+                                  modifierFlags: [], timestamp: time, windowNumber: self.pet.windowNumber,
+                                  context: nil, eventNumber: 0, clickCount: 1,
+                                  pressure: type == .leftMouseUp ? 0 : 1)!
+            }
+            self.pet.mouseDown(with: event(.leftMouseDown, at: start, time: timestamp))
+            self.pet.mouseDragged(with: event(.leftMouseDragged, at: end, time: timestamp + duration))
+            self.pet.mouseUp(with: event(.leftMouseUp, at: end, time: timestamp + duration + 0.1))
+        }
+        var checks: [(Double, () -> Void)] = [
             (1, { record("idle") }),
             (2, { self.pet.applyScale(0.45) }),
             (3, { record("small"); self.pet.applyScale(0.95) }),
@@ -106,14 +141,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }),
             (41, { record("bubble") })
         ]
+        let boundaryCases = ["left", "right", "top", "bottom",
+                             "top-left", "top-right", "bottom-left", "bottom-right"]
+        for (index, boundary) in boundaryCases.enumerated() {
+            let phase = "release-\(boundary)"
+            let delay = 42 + Double(index) * 0.75
+            checks.append((delay, {
+                self.pet.hideBubble()
+                self.pet.applyScale([0.45, 0.70, 0.95, 1.15][index % 4])
+                guard let screen = self.pet.screen ?? NSScreen.main else { return }
+                let visible = screen.visibleFrame
+                let size = self.pet.frame.size
+                let center = NSPoint(x: visible.midX - size.width / 2,
+                                     y: visible.midY - size.height / 2)
+                self.pet.setFrameOrigin(center)
+                let body = self.pet.visiblePetFrame.offsetBy(dx: -center.x, dy: -center.y)
+                // 四边直接贴住角色轮廓，四角越界 16pt 后松手；透明留白不参与限制。
+                let inset: CGFloat = boundary.contains("-") ? -16 : 0
+                let x = boundary.contains("left") ? visible.minX - body.minX + inset :
+                    (boundary.contains("right") ? visible.maxX - body.maxX - inset : center.x)
+                let y = boundary.contains("bottom") ? visible.minY - body.minY + inset :
+                    (boundary.contains("top") ? visible.maxY - body.maxY - inset : center.y)
+                dragAndRelease(at: NSPoint(x: x, y: y))
+                releasedOrigins[phase] = self.pet.frame.origin
+            }))
+            checks.append((delay + 0.5, { record(phase) }))
+        }
+        checks.append((49, {
+            releasedOrigins["edge-bubble"] = self.pet.frame.origin
+            releasedOrigins["after-edge-bubble"] = self.pet.frame.origin
+            self.pet.showBubble(text: "靠边提醒结束后继续显示", duration: 2)
+            record("edge-bubble")
+        }))
+        checks.append((52, { record("after-edge-bubble") }))
+        checks.append((53, {
+            if let visible = (self.pet.screen ?? NSScreen.main)?.visibleFrame {
+                self.pet.prefs.lastPositionX = visible.maxX - 10
+                self.pet.prefs.lastPositionY = visible.maxY - 10
+                self.pet.restorePosition()
+            }
+            record("restore-offscreen-position")
+            if let visible = (self.pet.screen ?? NSScreen.main)?.visibleFrame {
+                let body = self.pet.visiblePetFrame.offsetBy(dx: -self.pet.frame.minX, dy: -self.pet.frame.minY)
+                self.pet.setFrameOrigin(NSPoint(x: visible.minX - body.minX, y: visible.midY - body.midY))
+                self.pet.rememberPosition()
+                releasedOrigins["restore-edge-position"] = self.pet.frame.origin
+                self.pet.placeAtDefaultPosition()
+                self.pet.restorePosition()
+            }
+            record("restore-edge-position")
+        }))
         for (delay, action) in checks {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { action() }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 42) {
-            let expectedStates = ["idle": "idle", "idle-after-loop": "idle", "click": "click",
+        DispatchQueue.main.asyncAfter(deadline: .now() + 54) {
+            var expectedStates = ["idle": "idle", "idle-after-loop": "idle", "click": "click",
                                   "return-to-idle": "idle", "drag": "drag", "idle-restored": "idle",
                                   "wide-animation": "wide-animation", "full-canvas-effects": "full-canvas-effects"]
-            let ok = observations.allSatisfy { observation in
+            for boundary in boundaryCases { expectedStates["release-\(boundary)"] = "idle" }
+            expectedStates["edge-bubble"] = "idle"
+            expectedStates["after-edge-bubble"] = "idle"
+            expectedStates["restore-offscreen-position"] = "idle"
+            expectedStates["restore-edge-position"] = "idle"
+            let ok = observations.count == 24 && observations.allSatisfy { observation in
                 (expectedStates[observation["phase"] as? String ?? ""].map { expected in
                     expected == (observation["state"] as? String)
                 } ?? true) &&
@@ -121,7 +211,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 (observation["serverMatchesFrame"] as? Bool == true) &&
                 (observation["hasHitPixels"] as? Bool == true) &&
                 (observation["canvasInsideWindow"] as? Bool == true) &&
-                (observation["windowFullyOnScreen"] as? Bool == true) &&
+                (observation["petFullyOnScreen"] as? Bool == true) &&
+                (observation["bubbleFullyOnScreen"] as? Bool == true) &&
+                (observation["windowVisible"] as? Bool == true) &&
+                (observation["positionStable"] as? Bool == true) &&
+                (observation["atRequestedBoundary"] as? Bool == true) &&
+                ((observation["phase"] as? String != "after-edge-bubble") ||
+                 (observation["bubbleVisible"] as? Bool == false)) &&
                 ((observation["state"] as? String != "idle") ||
                  ((observation["transparentCornerPassesThrough"] as? Bool == true) &&
                   (observation["centerReceivesMouse"] as? Bool == true))) &&
@@ -186,7 +282,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        pet?.rememberPosition()
+        if let pet {
+            prefs?.lastPositionX = pet.frame.minX
+            prefs?.lastPositionY = pet.frame.minY
+            prefs?.petScale = pet.prefs.petScale
+            prefs?.alwaysOnTop = pet.prefs.alwaysOnTop
+        }
         prefs?.save()
     }
 
@@ -194,10 +295,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func screenChanged() {
         guard let pet else { return }
-        if pet.isEdgeHidden {
-            pet.keepFullyOnScreen()
-            return
-        }
         if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(pet.frame) }) {
             pet.keepFullyOnScreen()
         } else {
@@ -382,7 +479,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pet.hideBubble()
         } else {
             pet.orderFrontRegardless()
-            pet.revealFromEdge(animated: true)
+            pet.keepFullyOnScreen()
             pet.playIdle()
         }
     }
@@ -484,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         idleTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.pet.isEdgeHidden, !self.hidePet,
+                if self.pet.state == "idle", !self.pet.isBubbleVisible, !self.hidePet,
                    self.prefs.randomActionsEnabled {
                     self.pet.playRandom()
                 }

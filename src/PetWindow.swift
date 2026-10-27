@@ -5,13 +5,6 @@ import AVFoundation
 @MainActor
 final class PetWindow: NSWindow {
 
-    private enum EdgeAttachment: Equatable {
-        case left
-        case right
-        case top
-        case bottom
-    }
-
     /// 每个播放槽都有自己的播放器和图层。切换素材时先在闲置槽解码首帧，再做短交叉淡化，
     /// 这样旧动作的最后一帧会一直垫在下面，不会因为 removeAllItems() 暴露透明空帧。
     private final class PlaybackSlot {
@@ -70,6 +63,8 @@ final class PetWindow: NSWindow {
     private var hitPixelBuffer: CVPixelBuffer?
     private var pointerTimer: Timer?
     private var pointerIsDown = false
+    private let isRenderTest = ProcessInfo.processInfo.environment["PET_RENDER_TEST_DIR"] != nil
+    private let restingSourceBounds: NSRect
 
     private(set) var state: String = "idle"
 
@@ -91,28 +86,8 @@ final class PetWindow: NSWindow {
     private var bubbleOverlay: BubbleOverlayView?
     private var bubbleHeight: CGFloat = 0
     private var bubbleHideTimer: Timer?
-    private var edgeToRestoreAfterBubble: (edge: EdgeAttachment, screen: NSScreen)?
-
-    // 贴边隐藏
-    private var edgeAttachment: EdgeAttachment?
-    private var edgeScreen: NSScreen?
-    private var edgeAnimationTarget: EdgeAttachment?
-    private var edgeAnimationTimer: Timer?
-    private var edgeAnimationStartedAt: CFTimeInterval = 0
-    private var edgeAnimationFrom = NSPoint.zero
-    private var edgeAnimationTo = NSPoint.zero
-    private var edgeAnimationEntering = false
-    private var edgeAnimationProgressFrom: CGFloat = 0
-    private var edgeAnimationProgressTo: CGFloat = 1
-    private var edgeVisualProgress: CGFloat = 0
-    private var edgeVisualEdge: EdgeAttachment?
-    private let edgeAnimationDuration: CFTimeInterval = 0.24
-    private let edgeSnapThreshold: CGFloat = 34
-    private var edgeDragRevealed = false
 
     var isBubbleVisible: Bool { bubbleHeight > 0 }
-    /// 贴边滑入/滑出期间也视为隐藏，随机动作不会在过渡中插入。
-    var isEdgeHidden: Bool { edgeAttachment != nil || edgeAnimationTarget != nil }
 
     // 回调
     var onClicked: ((NSPoint) -> Void)?
@@ -124,9 +99,64 @@ final class PetWindow: NSWindow {
                height: Self.sourceHeight * prefs.petScale)
     }
 
+    /// 放置位置以待机轮廓为准，允许画布中的透明留白越过屏幕边缘。
+    var visiblePetFrame: NSRect {
+        let s = CGFloat(prefs.petScale)
+        return NSRect(x: frame.minX + restingSourceBounds.minX * s,
+                      y: frame.minY + restingSourceBounds.minY * s,
+                      width: restingSourceBounds.width * s, height: restingSourceBounds.height * s)
+    }
+
+    private var placementScreen: NSScreen? {
+        let center = NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.midY)
+        return NSScreen.screens.first(where: { $0.frame.contains(center) }) ?? screen ?? NSScreen.main
+    }
+
+    private static func measureRestingBounds(library: ClipLibrary) -> NSRect {
+        let fallback = NSRect(x: 190, y: 20, width: 260, height: 300)
+        guard let url = library.idle.clips.first else { return fallback }
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.maximumSize = NSSize(width: sourceWidth, height: sourceHeight)
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        var bounds: NSRect?
+        // 合并待机动画不同姿态的轮廓，靠边后呼吸和轻微摇摆不会改变窗口位置。
+        for seconds in [0.0, 2.5, 5.0, 7.5] {
+            guard let image = try? generator.copyCGImage(at: CMTime(seconds: seconds, preferredTimescale: 600),
+                                                       actualTime: nil) else { continue }
+            let width = image.width, height = image.height
+            var rgba = [UInt8](repeating: 0, count: width * height * 4)
+            let drawn = rgba.withUnsafeMutableBytes { bytes -> Bool in
+                guard let context = CGContext(data: bytes.baseAddress, width: width, height: height,
+                                              bitsPerComponent: 8, bytesPerRow: width * 4,
+                                              space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue |
+                                                  CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+                return true
+            }
+            guard drawn else { continue }
+            var minX = width, minY = height, maxX = -1, maxY = -1
+            for y in 0..<height {
+                for x in 0..<width where rgba[(y * width + x) * 4 + 3] > 12 {
+                    minX = min(minX, x); maxX = max(maxX, x)
+                    minY = min(minY, y); maxY = max(maxY, y)
+                }
+            }
+            guard maxX >= minX, maxY >= minY else { continue }
+            let rect = NSRect(x: CGFloat(minX) / CGFloat(width) * sourceWidth,
+                              y: CGFloat(height - maxY - 1) / CGFloat(height) * sourceHeight,
+                              width: CGFloat(maxX - minX + 1) / CGFloat(width) * sourceWidth,
+                              height: CGFloat(maxY - minY + 1) / CGFloat(height) * sourceHeight)
+            bounds = bounds.map { $0.union(rect) } ?? rect
+        }
+        return bounds?.insetBy(dx: -2, dy: -2) ?? fallback
+    }
+
     init(library: ClipLibrary, prefs: Preferences) {
         self.library = library
         self.prefs = prefs
+        self.restingSourceBounds = Self.measureRestingBounds(library: library)
         let w = Self.sourceWidth * prefs.petScale
         let h = Self.sourceHeight * prefs.petScale + Self.bubbleArea
         super.init(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
@@ -175,16 +205,7 @@ final class PetWindow: NSWindow {
         let canvasW = Self.sourceWidth * s
         let canvasH = Self.sourceHeight * s
         let totalH = canvasH + Self.bubbleArea
-        let normalOrigin = NSPoint(x: frame.midX - canvasW / 2, y: frame.minY)
-        let origin: NSPoint
-        if edgeAnimationTimer == nil,
-           let edge = edgeAttachment,
-           let screen = edgeScreen ?? NSScreen.main {
-            origin = edgeOrigin(for: edge, on: screen, frameSize: NSSize(width: canvasW, height: totalH),
-                                normalOrigin: normalOrigin)
-        } else {
-            origin = normalOrigin
-        }
+        let origin = NSPoint(x: frame.midX - canvasW / 2, y: frame.minY)
         setFrame(NSRect(origin: origin, size: NSSize(width: canvasW, height: totalH)), display: true)
 
         CATransaction.begin()
@@ -198,8 +219,7 @@ final class PetWindow: NSWindow {
     }
 
     private func layoutVideoLayers(canvasW: CGFloat, canvasH: CGFloat) {
-        let videoOffsetY = edgeVideoOffset(for: canvasH)
-        videoHost.frame = NSRect(x: 0, y: videoOffsetY, width: canvasW, height: canvasH)
+        videoHost.frame = NSRect(x: 0, y: 0, width: canvasW, height: canvasH)
         for slot in playbackSlots {
             slot.layer.frame = videoHost.bounds
         }
@@ -245,6 +265,7 @@ final class PetWindow: NSWindow {
     private func updatePointerHitTesting() {
         guard isVisible else { ignoresMouseEvents = true; return }
         if playbackSlots[hitSlotIndex].player.currentItem !== hitOutputItem { refreshHitPixels() }
+        guard !isRenderTest else { ignoresMouseEvents = true; return }
         guard !pointerIsDown else { ignoresMouseEvents = false; return }
         let point = mouseLocationOutsideOfEventStream
         guard contentView?.bounds.contains(point) == true else { ignoresMouseEvents = true; return }
@@ -254,245 +275,15 @@ final class PetWindow: NSWindow {
 
     private func constrainedOrigin(_ origin: NSPoint, on screen: NSScreen) -> NSPoint {
         let visible = screen.visibleFrame
-        return NSPoint(x: min(max(origin.x, visible.minX), max(visible.minX, visible.maxX - frame.width)),
-                       y: min(max(origin.y, visible.minY), max(visible.minY, visible.maxY - frame.height)))
-    }
-
-    private func edgePeekWidth() -> CGFloat {
-        max(76, min(132, 150 * CGFloat(prefs.petScale)))
-    }
-
-    private func edgePeekHeight() -> CGFloat {
-        max(120, min(180, 210 * CGFloat(prefs.petScale)))
-    }
-
-    private func edgeVideoOffset(for canvasH: CGFloat) -> CGFloat {
-        guard edgeVisualProgress > 0,
-              edgeVisualEdge == .top || edgeVisualEdge == .bottom else { return 0 }
-        // 让角色上半身靠近贴边后的可见带，四边都优先露出脸和手部轮廓。
-        // 负值会把视频内容往窗口下方移，避免顶部贴边时只露出脚部。
-        return -edgeVisualProgress * canvasH * 0.18
-    }
-
-    private func clamped(_ value: CGFloat, lower: CGFloat, upper: CGFloat) -> CGFloat {
-        guard upper >= lower else { return lower }
-        return min(max(value, lower), upper)
-    }
-
-    private func edgeOrigin(for edge: EdgeAttachment,
-                            on screen: NSScreen,
-                            frameSize: NSSize,
-                            normalOrigin: NSPoint) -> NSPoint {
-        let visible = screen.visibleFrame
-        let peekX = edgePeekWidth()
-        let peekY = edgePeekHeight()
-        let x: CGFloat
-        let y: CGFloat
-        switch edge {
-        case .left:
-            // 只保留窗口右侧的一小段，让角色从左侧屏缘探出来。
-            x = visible.minX - frameSize.width + peekX
-            y = clamped(normalOrigin.y, lower: visible.minY, upper: visible.maxY - frameSize.height)
-        case .right:
-            x = visible.maxX - peekX
-            y = clamped(normalOrigin.y, lower: visible.minY, upper: visible.maxY - frameSize.height)
-        case .top:
-            x = clamped(normalOrigin.x, lower: visible.minX, upper: visible.maxX - frameSize.width)
-            y = visible.maxY - frameSize.height + peekY
-        case .bottom:
-            x = clamped(normalOrigin.x, lower: visible.minX, upper: visible.maxX - frameSize.width)
-            y = visible.minY + peekY - frameSize.height
-        }
-        return NSPoint(x: x, y: y)
-    }
-
-    private func fullyVisibleOrigin(for edge: EdgeAttachment?, on screen: NSScreen) -> NSPoint {
-        let visible = screen.visibleFrame
-        let normal = frame.origin
-        let x: CGFloat
-        let y: CGFloat
-        switch edge {
-        case .left:
-            x = visible.minX + 12
-            y = clamped(normal.y, lower: visible.minY, upper: visible.maxY - frame.height)
-        case .right:
-            x = visible.maxX - frame.width - 12
-            y = clamped(normal.y, lower: visible.minY, upper: visible.maxY - frame.height)
-        case .top:
-            x = clamped(normal.x, lower: visible.minX, upper: visible.maxX - frame.width)
-            y = visible.maxY - frame.height - 12
-        case .bottom:
-            x = clamped(normal.x, lower: visible.minX, upper: visible.maxX - frame.width)
-            y = visible.minY + 12
-        case .none:
-            x = clamped(normal.x, lower: visible.minX, upper: visible.maxX - frame.width)
-            y = clamped(normal.y, lower: visible.minY, upper: visible.maxY - frame.height)
-        }
-        return NSPoint(x: x, y: y)
-    }
-
-    private func screen(for point: NSPoint) -> NSScreen? {
-        if let exact = NSScreen.screens.first(where: { $0.frame.insetBy(dx: -2, dy: -2).contains(point) }) {
-            return exact
-        }
-        return NSScreen.screens.min { lhs, rhs in
-            distanceSquared(from: point, to: lhs.frame) < distanceSquared(from: point, to: rhs.frame)
-        }
-    }
-
-    private func distanceSquared(from point: NSPoint, to rect: NSRect) -> CGFloat {
-        let dx = point.x < rect.minX ? rect.minX - point.x : (point.x > rect.maxX ? point.x - rect.maxX : 0)
-        let dy = point.y < rect.minY ? rect.minY - point.y : (point.y > rect.maxY ? point.y - rect.maxY : 0)
-        return dx * dx + dy * dy
-    }
-
-    private func edgeCandidate(at point: NSPoint) -> (edge: EdgeAttachment, screen: NSScreen)? {
-        guard let target = screen(for: point) else { return nil }
-        let visible = target.visibleFrame
-        let candidates: [(EdgeAttachment, CGFloat)] = [
-            (.left, min(abs(point.x - visible.minX), abs(frame.minX - visible.minX))),
-            (.right, min(abs(point.x - visible.maxX), abs(frame.maxX - visible.maxX))),
-            (.bottom, min(abs(point.y - visible.minY), abs(frame.minY - visible.minY))),
-            (.top, min(abs(point.y - visible.maxY), abs(frame.maxY - visible.maxY)))
-        ]
-        guard let closest = candidates.min(by: { $0.1 < $1.1 }), closest.1 <= edgeSnapThreshold else {
-            return nil
-        }
-        return (closest.0, target)
-    }
-
-    private func edgeName(_ edge: EdgeAttachment?) -> String {
-        switch edge {
-        case .left: return "left"
-        case .right: return "right"
-        case .top: return "top"
-        case .bottom: return "bottom"
-        case .none: return "none"
-        }
-    }
-
-    private func setEdgeVisualProgress(_ progress: CGFloat) {
-        edgeVisualProgress = min(max(progress, 0), 1)
-        let s = CGFloat(prefs.petScale)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        layoutVideoLayers(canvasW: Self.sourceWidth * s, canvasH: Self.sourceHeight * s)
-        CATransaction.commit()
-    }
-
-    private func completeEdgeAnimation(to edge: EdgeAttachment?, on screen: NSScreen) {
-        edgeAnimationTimer?.invalidate()
-        edgeAnimationTimer = nil
-        edgeAnimationTarget = nil
-        edgeAnimationEntering = false
-        setFrameOrigin(edgeAnimationTo)
-        if let edge {
-            edgeAttachment = edge
-            edgeScreen = screen
-            edgeVisualEdge = edge
-            setEdgeVisualProgress(1)
-        } else {
-            edgeAttachment = nil
-            edgeScreen = nil
-            edgeVisualEdge = nil
-            setEdgeVisualProgress(0)
-        }
-        rememberPosition()
-    }
-
-    private func advanceEdgeAnimation() {
-        let now = CACurrentMediaTime()
-        let raw = min(max((now - edgeAnimationStartedAt) / edgeAnimationDuration, 0), 1)
-        let eased = raw * raw * (3 - 2 * raw)
-        let origin = NSPoint(x: edgeAnimationFrom.x + (edgeAnimationTo.x - edgeAnimationFrom.x) * eased,
-                             y: edgeAnimationFrom.y + (edgeAnimationTo.y - edgeAnimationFrom.y) * eased)
-        setFrameOrigin(origin)
-        let progress = edgeAnimationProgressFrom
-            + (edgeAnimationProgressTo - edgeAnimationProgressFrom) * eased
-        setEdgeVisualProgress(progress)
-        if raw >= 1, let screen = edgeScreen {
-            completeEdgeAnimation(to: edgeAnimationEntering ? edgeAnimationTarget : nil, on: screen)
-        }
-    }
-
-    private func animateEdge(to edge: EdgeAttachment?, on screen: NSScreen, animated: Bool) {
-        edgeAnimationTimer?.invalidate()
-        edgeAnimationTimer = nil
-        edgeScreen = screen
-        edgeAnimationFrom = frame.origin
-        let normalOrigin = frame.origin
-        edgeAnimationTo = edge.map {
-            edgeOrigin(for: $0, on: screen, frameSize: frame.size, normalOrigin: normalOrigin)
-        } ?? fullyVisibleOrigin(for: edgeAttachment, on: screen)
-        edgeAnimationEntering = edge != nil
-        edgeAnimationProgressFrom = edgeVisualProgress
-        edgeAnimationProgressTo = edge == nil ? 0 : 1
-
-        if let edge {
-            edgeAnimationTarget = edge
-            edgeVisualEdge = edge
-        } else {
-            edgeAnimationTarget = nil
-            if edgeVisualEdge == nil { edgeVisualEdge = edgeAttachment }
-        }
-
-        if !animated || edgeAnimationFrom == edgeAnimationTo {
-            completeEdgeAnimation(to: edge, on: screen)
-            return
-        }
-        edgeAnimationStartedAt = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.advanceEdgeAnimation() }
-        }
-        edgeAnimationTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
-    private func attachToEdge(_ edge: EdgeAttachment, on screen: NSScreen, animated: Bool) {
-        guard bubbleHeight == 0 else { return }
-        stopPhysics()
-        edgeScreen = screen
-        playIdle(smooth: true)
-        animateEdge(to: edge, on: screen, animated: animated)
-    }
-
-    func revealFromEdge(animated: Bool = true) {
-        guard edgeAttachment != nil || edgeAnimationTarget != nil else { return }
-        let edge = edgeAttachment ?? edgeAnimationTarget
-        let targetScreen = edgeScreen ?? screen(for: NSPoint(x: frame.midX, y: frame.midY)) ?? NSScreen.main
-        guard let targetScreen else { return }
-        if edgeAttachment == nil, let edge { edgeAttachment = edge }
-        animateEdge(to: nil, on: targetScreen, animated: animated)
-    }
-
-    private func revealForDrag() {
-        let edge = edgeAttachment ?? edgeAnimationTarget
-        guard let targetScreen = edgeScreen ?? screen(for: NSEvent.mouseLocation) ?? NSScreen.main else { return }
-        edgeAnimationTimer?.invalidate()
-        edgeAnimationTimer = nil
-        edgeAnimationTarget = nil
-        edgeAttachment = nil
-        edgeScreen = nil
-        edgeVisualEdge = nil
-        edgeVisualProgress = 0
-        setFrameOrigin(fullyVisibleOrigin(for: edge, on: targetScreen))
-        setEdgeVisualProgress(0)
-        edgeDragRevealed = true
-        mouseDownScreen = NSEvent.mouseLocation
-        windowOriginAtDown = frame.origin
-        lastDragSamples = [(CACurrentMediaTime(), mouseDownScreen)]
+        let body = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
+        let minX = visible.minX - body.minX, maxX = visible.maxX - body.maxX
+        let minY = visible.minY - body.minY, maxY = visible.maxY - body.maxY
+        return NSPoint(x: min(max(origin.x, minX), max(minX, maxX)),
+                       y: min(max(origin.y, minY), max(minY, maxY)))
     }
 
     func keepFullyOnScreen() {
-        if let edge = edgeAttachment,
-           let target = edgeScreen ?? screen(for: NSPoint(x: frame.midX, y: frame.midY)) {
-            let normal = frame.origin
-            let origin = edgeOrigin(for: edge, on: target, frameSize: frame.size, normalOrigin: normal)
-            setFrameOrigin(origin)
-            setEdgeVisualProgress(1)
-            return
-        }
-        guard let target = screen ?? NSScreen.main else { return }
+        guard let target = placementScreen else { return }
         let visible = target.visibleFrame
         if frame.width > visible.width || frame.height > visible.height {
             let fit = min(visible.width / Self.sourceWidth,
@@ -504,21 +295,24 @@ final class PetWindow: NSWindow {
         let density = backingScaleFactor
         setFrameOrigin(NSPoint(x: (origin.x * density).rounded() / density,
                                y: (origin.y * density).rounded() / density))
+        layoutBubble()
+    }
+
+    private func layoutBubble() {
+        guard let overlay = bubbleOverlay, let screen = placementScreen, let content = contentView else { return }
+        let visible = screen.visibleFrame.offsetBy(dx: -frame.minX, dy: -frame.minY).intersection(content.bounds)
+        guard !visible.isEmpty else { return }
+        let width = Self.bubbleWidth * CGFloat(prefs.petScale)
+        let normalX = (bodySize.width - width) / 2
+        let x = min(max(normalX, visible.minX), max(visible.minX, visible.maxX - width))
+        let y = min(max(bodySize.height, visible.minY), max(visible.minY, visible.maxY - Self.bubbleArea))
+        overlay.frame = NSRect(x: x, y: y, width: width, height: Self.bubbleArea)
     }
 
     // MARK: - 气泡
 
     func showBubble(text: String, duration: TimeInterval, emphasize: Bool = false) {
-        if let edge = edgeAttachment, let screen = edgeScreen ?? NSScreen.main {
-            edgeToRestoreAfterBubble = (edge, screen)
-            revealFromEdge(animated: true)
-        } else if edgeAnimationTarget != nil {
-            // 正在滑入侧边时，先中止隐藏并恢复完整窗口，保证提醒气泡不会被屏幕裁掉。
-            if let edge = edgeAnimationTarget, let screen = edgeScreen ?? NSScreen.main {
-                edgeToRestoreAfterBubble = (edge, screen)
-            }
-            revealFromEdge(animated: true)
-        }
+        keepFullyOnScreen()
         bubbleHideTimer?.invalidate()
         let s = CGFloat(prefs.petScale)
         let roleW = Self.bubbleWidth * s
@@ -532,6 +326,7 @@ final class PetWindow: NSWindow {
         }
         guard let overlay = bubbleOverlay else { return }
         overlay.frame = NSRect(x: bubbleX, y: roleH, width: roleW, height: Self.bubbleArea)
+        layoutBubble()
         overlay.restoreBackground()
         let cardH = overlay.update(text: text, emphasized: emphasize, cardWidth: roleW)
         bubbleHeight = cardH
@@ -548,20 +343,10 @@ final class PetWindow: NSWindow {
         guard bubbleHeight > 0 else { return }
         bubbleHeight = 0
         bubbleOverlay?.clear()
-
-        if let restore = edgeToRestoreAfterBubble {
-            edgeToRestoreAfterBubble = nil
-            if state == "idle", !pointerIsDown {
-                attachToEdge(restore.edge, on: restore.screen, animated: true)
-            } else {
-                // 动作还未结束时先记住目标，回到待机的同一轮继续贴边。
-                edgeToRestoreAfterBubble = restore
-            }
-        }
     }
 
     func applyScale(_ scale: Double) {
-        let visible = (screen ?? NSScreen.main)?.visibleFrame
+        let visible = placementScreen?.visibleFrame
         let maxScale = visible.map { min($0.width / Self.sourceWidth, ($0.height - Self.bubbleArea) / Self.sourceHeight) } ?? 1.0
         let requested = min(max(scale, 0.25), maxScale)
         let density = backingScaleFactor
@@ -734,11 +519,18 @@ final class PetWindow: NSWindow {
         let server = windows?.first?[kCGWindowBounds as String] as? [String: Any]
         let serverW = (server?["Width"] as? NSNumber)?.doubleValue ?? 0
         let serverH = (server?["Height"] as? NSNumber)?.doubleValue ?? 0
+        let visible = placementScreen?.visibleFrame.insetBy(dx: -1, dy: -1)
+        let bubbleFrame = bubbleOverlay?.frame.offsetBy(dx: frame.minX, dy: frame.minY) ?? .zero
         return ["serverMatchesFrame": abs(serverW - frame.width) < 1 && abs(serverH - frame.height) < 1,
          "serverWindowWidth": serverW, "serverWindowHeight": serverH,
          "loopCount": activeSlot.looper?.loopCount ?? 0,
          "canvasInsideWindow": contentView?.bounds.contains(videoHost.frame) ?? false,
          "windowFullyOnScreen": screen?.visibleFrame.contains(frame) ?? false,
+         "petFullyOnScreen": visible?.contains(visiblePetFrame) ?? false,
+         "bubbleFullyOnScreen": !isBubbleVisible || (visible?.contains(bubbleFrame) ?? false),
+         "bubbleVisible": isBubbleVisible,
+         "restingSourceBounds": [restingSourceBounds.minX, restingSourceBounds.minY,
+                                 restingSourceBounds.width, restingSourceBounds.height],
          "canvasWidth": videoHost.frame.width, "canvasHeight": videoHost.frame.height,
          "transparentCornerPassesThrough": !isVisiblePixel(at: NSPoint(x: 1, y: 1)),
          "hasHitPixels": hitPixelBuffer != nil,
@@ -753,9 +545,7 @@ final class PetWindow: NSWindow {
          "videoWidth": player.currentItem?.presentationSize.width ?? 0,
          "videoHeight": player.currentItem?.presentationSize.height ?? 0,
          "looperStatus": activeSlot.looper?.status.rawValue ?? -1,
-         "edgeHidden": isEdgeHidden,
-         "edgeAttachment": edgeName(edgeAttachment),
-         "edgeAnimationTarget": edgeName(edgeAnimationTarget),
+         "windowVisible": isVisible,
          "error": player.currentItem?.error?.localizedDescription ?? ""]
     }
 
@@ -774,7 +564,7 @@ final class PetWindow: NSWindow {
     }
 
     func playRandom() {
-        guard prefs.randomActionsEnabled, !isEdgeHidden,
+        guard prefs.randomActionsEnabled,
               let url = library.random.pick(excluding: currentURL) else { return }
         play(url: url, loop: false, rate: 1.0, state: "random")
     }
@@ -786,10 +576,6 @@ final class PetWindow: NSWindow {
 
     func returnToIdle() {
         playIdle(smooth: true)
-        if let restore = edgeToRestoreAfterBubble, bubbleHeight == 0, !pointerIsDown {
-            edgeToRestoreAfterBubble = nil
-            attachToEdge(restore.edge, on: restore.screen, animated: true)
-        }
     }
 
     // MARK: - 鼠标交互
@@ -798,46 +584,42 @@ final class PetWindow: NSWindow {
         pointerIsDown = true
         ignoresMouseEvents = false
         stopPhysics()
-        mouseDownScreen = NSEvent.mouseLocation
+        mouseDownScreen = convertPoint(toScreen: event.locationInWindow)
         windowOriginAtDown = frame.origin
-        lastDragSamples = [(CACurrentMediaTime(), mouseDownScreen)]
+        lastDragSamples = [(event.timestamp, mouseDownScreen)]
         didDrag = false
-        edgeDragRevealed = false
         playDragFeedback()
     }
 
     override func mouseDragged(with event: NSEvent) {
-        let now = NSEvent.mouseLocation
-        var dx = now.x - mouseDownScreen.x
-        var dy = now.y - mouseDownScreen.y
+        let now = convertPoint(toScreen: event.locationInWindow)
+        let dx = now.x - mouseDownScreen.x
+        let dy = now.y - mouseDownScreen.y
         if abs(dx) > 3 || abs(dy) > 3 { didDrag = true }
-        if didDrag, isEdgeHidden, !edgeDragRevealed {
-            revealForDrag()
-            dx = now.x - mouseDownScreen.x
-            dy = now.y - mouseDownScreen.y
-        }
         let origin = NSPoint(x: windowOriginAtDown.x + dx, y: windowOriginAtDown.y + dy)
-        // 拖动期间不再按当前屏幕的 visibleFrame 限制 origin，允许窗口跨越屏幕分界并贴到任意边缘。
+        // 拖动时允许跨屏；松手时只限制角色轮廓，透明留白可以越过屏缘。
         setFrameOrigin(origin)
-        lastDragSamples.append((CACurrentMediaTime(), NSEvent.mouseLocation))
+        if isBubbleVisible { layoutBubble() }
+        lastDragSamples.append((event.timestamp, now))
         if lastDragSamples.count > 6 { lastDragSamples.removeFirst() }
     }
 
     override func mouseUp(with event: NSEvent) {
         pointerIsDown = false
         if didDrag {
+            keepFullyOnScreen()
             launchIfThrown()
         } else if let cb = onClicked {
             cb(NSEvent.mouseLocation)
         } else {
             returnToIdle()
         }
-        if !isEdgeHidden { rememberPosition() }
+        rememberPosition()
     }
 
     override func rightMouseDown(with event: NSEvent) {
         stopPhysics()
-        if isEdgeHidden { revealFromEdge(animated: true) }
+        keepFullyOnScreen()
         returnToIdle()
         onRightClicked?(NSEvent.mouseLocation)
     }
@@ -845,20 +627,15 @@ final class PetWindow: NSWindow {
     // MARK: - 物理（抛掷）
 
     private func launchIfThrown() {
-        if let candidate = edgeCandidate(at: NSEvent.mouseLocation), bubbleHeight == 0 {
-            velocity = .zero
-            attachToEdge(candidate.edge, on: candidate.screen, animated: true)
-            return
-        }
         guard lastDragSamples.count >= 2,
               let first = lastDragSamples.first, let last = lastDragSamples.last else {
-            finishDragWithoutThrow(); return
+            returnToIdle(); return
         }
         let dt = max(last.t - first.t, 0.001)
         let vx = (last.p.x - first.p.x) / CGFloat(dt)
         let vy = (last.p.y - first.p.y) / CGFloat(dt)
         if abs(vx) < 220 && abs(vy) < 220 {
-            finishDragWithoutThrow(); return
+            returnToIdle(); return
         }
         velocity = NSPoint(x: vx, y: vy)
         lastPhysicsTick = CACurrentMediaTime()
@@ -867,14 +644,6 @@ final class PetWindow: NSWindow {
         physicsTimer?.invalidate()
         physicsTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.stepPhysics() }
-        }
-    }
-
-    private func finishDragWithoutThrow() {
-        if let candidate = edgeCandidate(at: NSEvent.mouseLocation), bubbleHeight == 0 {
-            attachToEdge(candidate.edge, on: candidate.screen, animated: true)
-        } else {
-            returnToIdle()
         }
     }
 
@@ -897,25 +666,27 @@ final class PetWindow: NSWindow {
         origin.x += velocity.x * CGFloat(dt)
         origin.y += velocity.y * CGFloat(dt)
 
-        guard let scr = screen?.visibleFrame else { stopPhysics(); return }
+        guard let scr = placementScreen?.visibleFrame else { stopPhysics(); return }
+        let body = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
         let bounce: CGFloat = 0.55
 
-        if origin.x < scr.minX {
-            origin.x = scr.minX
+        if origin.x + body.minX < scr.minX {
+            origin.x = scr.minX - body.minX
             velocity.x = abs(velocity.x) * bounce
-        } else if origin.x + frame.width > scr.maxX {
-            origin.x = scr.maxX - frame.width
+        } else if origin.x + body.maxX > scr.maxX {
+            origin.x = scr.maxX - body.maxX
             velocity.x = -abs(velocity.x) * bounce
         }
-        if origin.y + frame.height > scr.maxY {
-            origin.y = scr.maxY - frame.height
+        if origin.y + body.maxY > scr.maxY {
+            origin.y = scr.maxY - body.maxY
             velocity.y = -abs(velocity.y) * bounce
         }
-        if origin.y <= scr.minY {
-            origin.y = scr.minY
+        if origin.y + body.minY <= scr.minY {
+            origin.y = scr.minY - body.minY
             if abs(velocity.y) < 120 {
                 velocity = .zero
                 setFrameOrigin(origin)
+                if isBubbleVisible { layoutBubble() }
                 stopPhysics()
                 returnToIdle()
                 rememberPosition()
@@ -925,6 +696,7 @@ final class PetWindow: NSWindow {
             velocity.x *= 0.82
         }
         setFrameOrigin(origin)
+        if isBubbleVisible { layoutBubble() }
     }
 
     // MARK: - 位置
@@ -938,7 +710,8 @@ final class PetWindow: NSWindow {
     func restorePosition() {
         if let x = prefs.lastPositionX, let y = prefs.lastPositionY {
             let p = NSPoint(x: x, y: y)
-            let visible = NSScreen.screens.contains { $0.visibleFrame.insetBy(dx: -40, dy: -40).contains(p) }
+            let savedFrame = NSRect(origin: p, size: frame.size)
+            let visible = NSScreen.screens.contains { $0.visibleFrame.intersects(savedFrame) }
             if visible {
                 setFrameOrigin(p)
                 keepFullyOnScreen()

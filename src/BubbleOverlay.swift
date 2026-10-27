@@ -1,7 +1,7 @@
 import Cocoa
 
-/// 气泡层：固定在桌宠窗口顶部气泡区，内部用 CALayer 绘制卡片与文字。
-/// overlay 自身位置/尺寸保持不变（已验证可显示），卡片在内部按需布局。
+/// 气泡层：默认位于桌宠头顶，靠近屏缘时在同一窗口内调整位置。
+/// 卡片与文字由 CALayer 绘制，移动气泡不改变角色或窗口的位置。
 final class BubbleOverlayView: NSView {
 
     private let cardLayer = CALayer()

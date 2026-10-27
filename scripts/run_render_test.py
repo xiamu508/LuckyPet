@@ -33,7 +33,8 @@ if not report.exists() or report.stat().st_mtime<started:
 data=json.loads(report.read_text())
 for item in data['observations']:
     print(item['phase'],'state=',item['state'],'canvas=',item['canvasInsideWindow'],
-          'screen=',item['windowFullyOnScreen'],'server=',item['serverMatchesFrame'],
+          'petOnScreen=',item['petFullyOnScreen'],'stable=',item['positionStable'],
+          'boundary=',item['atRequestedBoundary'],'server=',item['serverMatchesFrame'],
           'ready=',item['readyForDisplay'],'hitPixels=',item['hasHitPixels'],flush=True)
 print('NATIVE_RENDER_PASSED',data['passed'],flush=True)
 if not data['passed']:
