@@ -271,8 +271,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 (observation["bubbleFullyOnScreen"] as? Bool == true) &&
                 (observation["bubbleInsideWindow"] as? Bool == true) &&
                 (observation["bubbleTextFullyVisible"] as? Bool == true) &&
+                ((observation["bubbleOverlapsAnimation"] as? Bool) == false) &&
                 (!headBubblePhases.contains(observation["phase"] as? String ?? "") ||
-                 abs((observation["bubbleGap"] as? CGFloat ?? 0) - 10) < 0.5) &&
+                 (observation["bubbleGap"] as? CGFloat ?? 0) > 0) &&
                 ((observation["phase"] as? String != "after-reminder") ||
                  (observation["reminderActive"] as? Bool == false)) &&
                 (observation["windowVisible"] as? Bool == true) &&

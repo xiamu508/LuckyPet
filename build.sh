@@ -44,6 +44,7 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp NOTICE.md LICENSE "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/THIRD_PARTY"
 cp THIRD_PARTY/Real-ESRGAN-LICENSE "$APP/Contents/Resources/THIRD_PARTY/"
+cp Assets/hd_manifest.json "$APP/Contents/Resources/hd_manifest.json"
 
 echo "== 4/6 复制动画素材 =="
 rsync -a Assets/clips/ "$APP/Contents/Resources/clips/"

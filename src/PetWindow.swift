@@ -31,7 +31,9 @@ final class PetWindow: NSWindow {
     static let sourceWidth: CGFloat = 640
     static let sourceHeight: CGFloat = 360
     static let bubbleWidth: CGFloat = 308
-    /// 扩大透明播放窗口，预留多行提醒空间；气泡本身仍紧邻角色头顶。
+    /// 播放画布四周保留透明余量，避免动作贴边时被窗口边界视觉上截住。
+    static let playbackInset: CGFloat = 20
+    /// 顶部气泡区固定保留，避免显示/隐藏气泡时改变 WindowServer 窗口尺寸。
     static let bubbleArea: CGFloat = 280
     private static let bubbleGap: CGFloat = 10
     private static let bubbleMargin: CGFloat = 12
@@ -126,9 +128,24 @@ final class PetWindow: NSWindow {
     /// 放置位置以待机轮廓为准，允许画布中的透明留白越过屏幕边缘。
     var visiblePetFrame: NSRect {
         let s = displayScale
-        return NSRect(x: frame.minX + restingSourceBounds.minX * s,
-                      y: frame.minY + restingSourceBounds.minY * s,
+        let videoOrigin = playbackOrigin(for: s)
+        return NSRect(x: frame.minX + videoOrigin.x + restingSourceBounds.minX * s,
+                      y: frame.minY + videoOrigin.y + restingSourceBounds.minY * s,
                       width: restingSourceBounds.width * s, height: restingSourceBounds.height * s)
+    }
+
+    private func playbackOrigin(for scale: CGFloat) -> NSPoint {
+        NSPoint(x: Self.playbackInset * scale, y: Self.playbackInset * scale)
+    }
+
+    private func animationFrameInWindow(for scale: CGFloat) -> NSRect {
+        let fallback = NSRect(x: 0, y: 0, width: Self.sourceWidth, height: Self.sourceHeight)
+        let sourceBounds = library.animationBounds(for: currentURL) ?? fallback
+        let origin = playbackOrigin(for: scale)
+        return NSRect(x: origin.x + sourceBounds.minX * scale,
+                      y: origin.y + sourceBounds.minY * scale,
+                      width: sourceBounds.width * scale,
+                      height: sourceBounds.height * scale)
     }
 
     private var placementScreen: NSScreen? {
@@ -181,8 +198,11 @@ final class PetWindow: NSWindow {
         self.library = library
         self.prefs = prefs
         self.restingSourceBounds = Self.measureRestingBounds(library: library)
-        let w = Self.sourceWidth * prefs.petScale
-        let h = Self.sourceHeight * prefs.petScale + Self.bubbleArea
+        let initialScale = CGFloat(prefs.petScale)
+        let initialCanvasWidth = Self.sourceWidth + Self.playbackInset * 2
+        let initialCanvasHeight = Self.sourceHeight + Self.playbackInset * 2
+        let w = initialCanvasWidth * initialScale
+        let h = initialCanvasHeight * initialScale + Self.bubbleArea
         super.init(contentRect: NSRect(x: 0, y: 0, width: w, height: h),
                    styleMask: [.borderless],
                    backing: .buffered,
@@ -222,16 +242,19 @@ final class PetWindow: NSWindow {
     // MARK: - 几何
 
     private func frameSize(for scale: CGFloat) -> NSSize {
-        NSSize(width: Self.sourceWidth * scale,
-               height: Self.sourceHeight * scale + Self.bubbleArea)
+        let canvasWidth = Self.sourceWidth + Self.playbackInset * 2
+        let canvasHeight = Self.sourceHeight + Self.playbackInset * 2
+        return NSSize(width: canvasWidth * scale,
+                      height: canvasHeight * scale + Self.bubbleArea)
     }
 
     /// 以角色轮廓中心为锚点计算窗口位置，并保证整个窗口仍落在屏幕可见区域内。
     private func frameOrigin(for scale: CGFloat, bodyCenter: NSPoint, on screen: NSScreen) -> NSPoint {
         let size = frameSize(for: scale)
         let visible = screen.visibleFrame
-        let desired = NSPoint(x: bodyCenter.x - restingSourceBounds.midX * scale,
-                               y: bodyCenter.y - restingSourceBounds.midY * scale)
+        let videoOrigin = playbackOrigin(for: scale)
+        let desired = NSPoint(x: bodyCenter.x - videoOrigin.x - restingSourceBounds.midX * scale,
+                               y: bodyCenter.y - videoOrigin.y - restingSourceBounds.midY * scale)
         let maxX = max(visible.minX, visible.maxX - size.width)
         let maxY = max(visible.minY, visible.maxY - size.height)
         return NSPoint(x: min(max(desired.x, visible.minX), maxX),
@@ -243,8 +266,7 @@ final class PetWindow: NSWindow {
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layoutVideoLayers(canvasW: Self.sourceWidth * scale,
-                          canvasH: Self.sourceHeight * scale)
+        layoutVideoLayers(scale: scale)
         CATransaction.commit()
 
         if isBubbleVisible { layoutBubble() }
@@ -259,8 +281,11 @@ final class PetWindow: NSWindow {
         if isVisible && !isReminderActive { keepFullyOnScreen() }
     }
 
-    private func layoutVideoLayers(canvasW: CGFloat, canvasH: CGFloat) {
-        videoHost.frame = NSRect(x: 0, y: 0, width: canvasW, height: canvasH)
+    private func layoutVideoLayers(scale: CGFloat) {
+        let origin = playbackOrigin(for: scale)
+        let canvasW = Self.sourceWidth * scale
+        let canvasH = Self.sourceHeight * scale
+        videoHost.frame = NSRect(x: origin.x, y: origin.y, width: canvasW, height: canvasH)
         for slot in playbackSlots {
             slot.layer.frame = videoHost.bounds
         }
@@ -289,8 +314,9 @@ final class PetWindow: NSWindow {
         guard let pixel = hitPixelBuffer else {
             // 解码器尚未输出首帧时，只允许角色中心区域交互。
             let s = displayScale
+            let local = videoHost.convert(point, from: nil)
             return NSRect(x: (Self.sourceWidth - 240) * s / 2, y: 20 * s,
-                          width: 240 * s, height: 300 * s).contains(point)
+                          width: 240 * s, height: 300 * s).contains(local)
         }
         let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
         let local = videoHost.convert(point, from: nil)
@@ -329,8 +355,10 @@ final class PetWindow: NSWindow {
         guard let target = placementScreen else { return }
         let visible = target.visibleFrame
         if frame.width > visible.width || frame.height > visible.height {
-            let fit = min(visible.width / Self.sourceWidth,
-                          max(1, visible.height - Self.bubbleArea) / Self.sourceHeight)
+            let canvasWidth = Self.sourceWidth + Self.playbackInset * 2
+            let canvasHeight = Self.sourceHeight + Self.playbackInset * 2
+            let fit = min(visible.width / canvasWidth,
+                          max(1, visible.height - Self.bubbleArea) / canvasHeight)
             applyScale(fit)
             return
         }
@@ -354,14 +382,15 @@ final class PetWindow: NSWindow {
             width = available.width
             height = overlay.update(text: text, emphasized: bubbleEmphasized, cardWidth: width)
         }
-        let body = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
-        let normalX = body.midX - width / 2
+        let animationFrame = animationFrameInWindow(for: displayScale)
+        let normalX = animationFrame.midX - width / 2
         let x = min(max(normalX, available.minX), max(available.minX, available.maxX - width))
-        let above = body.maxY + Self.bubbleGap
-        let below = body.minY - Self.bubbleGap - height
-        let preferredY = above + height <= available.maxY ? above :
-            (below >= available.minY ? below : available.maxY - height)
-        let y = min(max(preferredY, available.minY), max(available.minY, available.maxY - height))
+        // 气泡始终放在当前动画的安全 alpha 边界之外，避免遮住头顶特效。
+        let above = animationFrame.maxY + Self.bubbleGap
+        let bandMinY = max(animationFrame.maxY + Self.bubbleGap, available.minY)
+        let bandMaxY = min(content.bounds.maxY - Self.bubbleMargin, available.maxY)
+        let maxY = max(bandMinY, bandMaxY - height)
+        let y = min(max(above, bandMinY), maxY)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         overlay.frame = NSRect(x: x, y: y, width: width, height: height)
@@ -371,12 +400,32 @@ final class PetWindow: NSWindow {
 
     // MARK: - 气泡
 
+    private func keepBubbleFullyOnScreen() {
+        guard isBubbleVisible, let overlay = bubbleOverlay,
+              let screen = placementScreen else { return }
+        for _ in 0..<3 {
+            layoutBubble()
+            let visible = screen.visibleFrame
+            let bubble = overlay.frame.offsetBy(dx: frame.minX, dy: frame.minY)
+            var dx: CGFloat = 0
+            var dy: CGFloat = 0
+            if bubble.minX < visible.minX { dx = visible.minX - bubble.minX }
+            if bubble.maxX > visible.maxX { dx = visible.maxX - bubble.maxX }
+            if bubble.minY < visible.minY { dy = visible.minY - bubble.minY }
+            if bubble.maxY > visible.maxY { dy = visible.maxY - bubble.maxY }
+            if abs(dx) < 0.5 && abs(dy) < 0.5 { break }
+            setFrameOrigin(NSPoint(x: frame.minX + dx, y: frame.minY + dy))
+        }
+        layoutBubble()
+    }
+
     func showBubble(text: String, duration: TimeInterval, emphasize: Bool = false) {
-        if !isReminderActive { keepFullyOnScreen() }
         bubbleHideTimer?.invalidate()
         bubbleText = text
         bubbleEmphasized = emphasize
+        if !isReminderActive { keepFullyOnScreen() }
         layoutBubble()
+        keepBubbleFullyOnScreen()
         bubbleHideTimer = Timer.scheduledTimer(withTimeInterval: max(duration, 2.0), repeats: false) { [weak self] _ in
             Task { @MainActor in self?.hideBubble() }
         }
@@ -393,7 +442,10 @@ final class PetWindow: NSWindow {
     func applyScale(_ scale: Double) {
         guard !isReminderActive else { return }
         let visible = placementScreen?.visibleFrame
-        let maxScale = visible.map { min($0.width / Self.sourceWidth, ($0.height - Self.bubbleArea) / Self.sourceHeight) } ?? 1.0
+        let canvasWidth = Self.sourceWidth + Self.playbackInset * 2
+        let canvasHeight = Self.sourceHeight + Self.playbackInset * 2
+        let maxScale = visible.map { min($0.width / canvasWidth,
+                                           ($0.height - Self.bubbleArea) / canvasHeight) } ?? 1.0
         let requested = min(max(scale, 0.25), maxScale)
         let density = backingScaleFactor
         // 画布宽度取整到物理像素，同时保持视频宽高比。
@@ -439,8 +491,10 @@ final class PetWindow: NSWindow {
         let originalScale = displayScale
         let originalBodyCenter = NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.midY)
         let visible = screen.visibleFrame
-        let fitScale = min(visible.width / Self.sourceWidth,
-                           max(0, visible.height - Self.bubbleArea) / Self.sourceHeight)
+        let canvasWidth = Self.sourceWidth + Self.playbackInset * 2
+        let canvasHeight = Self.sourceHeight + Self.playbackInset * 2
+        let fitScale = min(visible.width / canvasWidth,
+                           max(0, visible.height - Self.bubbleArea) / canvasHeight)
         let targetScale = min(max(originalScale * 1.34, originalScale + 0.18), fitScale)
         let targetOrigin = frameOrigin(for: targetScale,
                                        bodyCenter: NSPoint(x: visible.midX, y: visible.midY),
@@ -782,6 +836,8 @@ final class PetWindow: NSWindow {
         let visible = placementScreen?.visibleFrame.insetBy(dx: -1, dy: -1)
         let serverBounds = NSRect(x: 0, y: 0, width: serverW, height: serverH)
         let petBounds = visiblePetFrame.offsetBy(dx: -frame.minX, dy: -frame.minY)
+        let videoFrame = videoHost.frame.offsetBy(dx: frame.minX, dy: frame.minY)
+        let animationFrame = animationFrameInWindow(for: displayScale).offsetBy(dx: frame.minX, dy: frame.minY)
         let bubbleFrame = bubbleOverlay?.frame.offsetBy(dx: frame.minX, dy: frame.minY) ?? .zero
         return ["serverMatchesFrame": abs(serverW - frame.width) < 1 && abs(serverH - frame.height) < 1,
          "serverWindowWidth": serverW, "serverWindowHeight": serverH,
@@ -794,6 +850,10 @@ final class PetWindow: NSWindow {
          "bubbleInsideServerWindow": !isBubbleVisible || serverBounds.contains(bubbleOverlay?.frame ?? .zero),
          "petInsideServerWindow": serverBounds.contains(petBounds),
          "bubbleTextFullyVisible": !isBubbleVisible || (bubbleOverlay?.isTextFullyVisible ?? false),
+         "bubbleOverlapsVideo": isBubbleVisible && bubbleFrame.intersects(videoFrame),
+         "bubbleOverlapsAnimation": isBubbleVisible && bubbleFrame.intersects(animationFrame),
+         "videoFrame": [videoFrame.minX, videoFrame.minY, videoFrame.width, videoFrame.height],
+         "animationFrame": [animationFrame.minX, animationFrame.minY, animationFrame.width, animationFrame.height],
          "bubbleGap": isBubbleVisible ? bubbleFrame.minY - visiblePetFrame.maxY : 0,
          "bubbleWidth": bubbleOverlay?.frame.width ?? 0,
          "bubbleHeight": bubbleHeight,
@@ -805,8 +865,8 @@ final class PetWindow: NSWindow {
          "canvasWidth": videoHost.frame.width, "canvasHeight": videoHost.frame.height,
          "transparentCornerPassesThrough": !isVisiblePixel(at: NSPoint(x: 1, y: 1)),
          "hasHitPixels": hitPixelBuffer != nil,
-         "centerReceivesMouse": isVisiblePixel(at: NSPoint(x: bodySize.width / 2,
-                                                          y: 164 * CGFloat(prefs.petScale))),
+         "centerReceivesMouse": isVisiblePixel(at: NSPoint(x: videoHost.frame.midX,
+                                                          y: videoHost.frame.minY + 164 * CGFloat(prefs.petScale))),
          "state": state, "rate": player.rate, "timeControlStatus": player.timeControlStatus.rawValue,
          "readyForDisplay": playerLayer.isReadyForDisplay,
          "itemStatus": player.currentItem?.status.rawValue ?? -1,
@@ -1033,9 +1093,10 @@ final class PetWindow: NSWindow {
         setFrameOrigin(constrainedOrigin(NSPoint(x: f.maxX - frame.width - 60, y: f.minY + 20), on: scr))
     }
 
-    /// 气泡锚点（角色头顶，屏幕坐标）
+    /// 气泡锚点（当前动画安全边界上方，屏幕坐标）
     func bubbleAnchor() -> NSPoint {
-        NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.maxY + Self.bubbleGap)
+        let bounds = animationFrameInWindow(for: displayScale)
+        return NSPoint(x: frame.minX + bounds.midX, y: frame.minY + bounds.maxY + Self.bubbleGap)
     }
 }
 
