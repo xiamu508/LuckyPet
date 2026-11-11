@@ -3,7 +3,7 @@ import ServiceManagement
 
 /// 设置窗口（纯 AppKit 实现，避免 SwiftUI 宏在命令行编译下的限制）
 @MainActor
-final class SettingsWindowController: NSObject {
+final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private var window: NSWindow?
     private var prefs: Preferences?
@@ -22,6 +22,22 @@ final class SettingsWindowController: NSObject {
     private var scaleLabel: NSTextField!
     private var breakStepper: NSStepper!
     private var breakLabel: NSTextField!
+    private var displayPopup: NSPopUpButton!
+    private var mouseBatteryToggle: NSButton?
+    private var batterySelectionLabel: NSTextField?
+    var onManageBattery: (() -> Void)?
+
+    func updateBatterySelection(_ updated: Preferences) {
+        prefs?.batteryDeviceID = updated.batteryDeviceID
+        prefs?.batteryDeviceName = updated.batteryDeviceName
+        updateMouseBatteryVisibility(updated.showMouseBattery)
+        batterySelectionLabel?.stringValue = "当前设备：\(updated.batteryDeviceName ?? "MCHOSE A5 Pro Max")"
+    }
+
+    func updateMouseBatteryVisibility(_ visible: Bool) {
+        prefs?.showMouseBattery = visible
+        mouseBatteryToggle?.state = visible ? .on : .off
+    }
 
     func show(prefs: Preferences,
               onChange: @escaping (Preferences) -> Void,
@@ -39,11 +55,17 @@ final class SettingsWindowController: NSObject {
             return
         }
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 680),
-                         styleMask: [.titled, .closable, .miniaturizable],
+                         styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
         w.title = "LuckyPet · 设置"
         w.isReleasedWhenClosed = false
-        w.center()
+        w.minSize = NSSize(width: 420, height: 520)
+        w.maxSize = NSSize(width: 820, height: 980)
+        w.setFrameAutosaveName("LuckyPet.SettingsWindow")
+        w.delegate = self
+        if !w.setFrameUsingName("LuckyPet.SettingsWindow") {
+            w.center()
+        }
         w.level = .floating
         window = w
         rebuildContent()
@@ -60,7 +82,8 @@ final class SettingsWindowController: NSObject {
     private func rebuildContent() {
         guard let w = window, let prefs else { return }
 
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 480, height: 680))
+        let initialSize = w.contentView?.bounds.size ?? NSSize(width: 480, height: 680)
+        let container = NSView(frame: NSRect(origin: .zero, size: initialSize))
         container.autoresizingMask = [.width, .height]
 
         let scroll = NSScrollView()
@@ -94,6 +117,7 @@ final class SettingsWindowController: NSObject {
         stack.addArrangedSubview(quietCard(prefs))
         stack.addArrangedSubview(deliveryCard(prefs))
         stack.addArrangedSubview(petCard(prefs))
+        stack.addArrangedSubview(batteryCard(prefs))
         stack.addArrangedSubview(aboutCard())
         for v in stack.arrangedSubviews {
             v.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -326,6 +350,36 @@ final class SettingsWindowController: NSObject {
 
     private func petCard(_ prefs: Preferences) -> NSView {
         var rows: [NSView] = []
+        displayPopup = NSPopUpButton()
+        displayPopup.controlSize = .small
+        displayPopup.target = self
+        displayPopup.action = #selector(displayChanged(_:))
+        displayPopup.widthAnchor.constraint(greaterThanOrEqualToConstant: 190).isActive = true
+        displayPopup.addItem(withTitle: "跟随桌宠当前屏幕")
+        displayPopup.item(at: 0)?.representedObject = NSNull()
+
+        let screens = NSScreen.screens.sorted { lhs, rhs in
+            (PetWindow.displayID(for: lhs) ?? 0) < (PetWindow.displayID(for: rhs) ?? 0)
+        }
+        let mainDisplayID = PetWindow.displayID(for: NSScreen.main)
+        for screen in screens {
+            guard let displayID = PetWindow.displayID(for: screen) else { continue }
+            let title = displayID == mainDisplayID
+                ? "主显示器 · \(screen.localizedName)"
+                : screen.localizedName
+            displayPopup.addItem(withTitle: title)
+            displayPopup.lastItem?.representedObject = NSNumber(value: displayID)
+        }
+        if let preferred = prefs.preferredDisplayID,
+           let index = displayPopup.itemArray.firstIndex(where: {
+               ($0.representedObject as? NSNumber)?.uint32Value == preferred
+           }) {
+            displayPopup.selectItem(at: index)
+        } else {
+            displayPopup.selectItem(at: 0)
+        }
+        rows.append(row([label("分配到显示器"), spacer(), displayPopup]))
+
         scaleSlider = NSSlider(value: prefs.petScale, minValue: 0.35, maxValue: 1.15,
                                target: self, action: #selector(scaleChanged(_:)))
         scaleSlider.widthAnchor.constraint(equalToConstant: 200).isActive = true
@@ -339,6 +393,24 @@ final class SettingsWindowController: NSObject {
         rows.append(switchToggle("开机自动启动", on: prefs.launchAtLogin, action: #selector(toggleLaunch(_:))))
         return cardContainer("桌宠", rows: rows)
     }
+
+    private func batteryCard(_ prefs: Preferences) -> NSView {
+        let toggle = switchToggle("菜单栏显示设备电量", on: prefs.showMouseBattery,
+                                  action: #selector(toggleMouseBattery(_:)))
+        mouseBatteryToggle = toggle
+        let selected = label("当前设备：\(prefs.batteryDeviceName ?? "MCHOSE A5 Pro Max")", size: 12)
+        selected.lineBreakMode = .byTruncatingMiddle
+        batterySelectionLabel = selected
+        let manage = NSButton(title: "选择 / 连接设备…", target: self, action: #selector(manageBattery))
+        manage.bezelStyle = .rounded
+        let hint = label("支持鼠标、蓝牙键盘、手柄、耳机；电量以设备实际提供为准。", size: 11,
+                         color: .secondaryLabelColor)
+        hint.maximumNumberOfLines = 2
+        hint.lineBreakMode = .byWordWrapping
+        return cardContainer("设备与电量", rows: [toggle, selected, manage, hint])
+    }
+
+    @objc private func manageBattery() { onManageBattery?() }
 
     private func aboutCard() -> NSView {
         let v = NSStackView()
@@ -384,6 +456,9 @@ final class SettingsWindowController: NSObject {
     @objc private func toggleRandom(_ b: NSButton) {
         commit { $0.randomActionsEnabled = (b.state == .on) }
     }
+    @objc private func toggleMouseBattery(_ b: NSButton) {
+        commit { $0.showMouseBattery = (b.state == .on) }
+    }
     @objc private func toggleLaunch(_ b: NSButton) {
         commit { $0.launchAtLogin = (b.state == .on) }
         if prefs?.launchAtLogin == true { LaunchHelper.register() } else { LaunchHelper.unregister() }
@@ -410,6 +485,10 @@ final class SettingsWindowController: NSObject {
         let v = (s.doubleValue * 100).rounded() / 100
         scaleLabel.stringValue = "\(Int(v * 100))%"
         commit { $0.petScale = v }
+    }
+    @objc private func displayChanged(_ p: NSPopUpButton) {
+        let id = (p.selectedItem?.representedObject as? NSNumber)?.uint32Value
+        commit { $0.preferredDisplayID = id }
     }
     @objc private func timeChanged(_ p: NSDatePicker) {
         let s = Self.dateToTime(p.dateValue)

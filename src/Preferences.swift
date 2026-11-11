@@ -40,10 +40,56 @@ struct Preferences: Codable {
     var randomActionsEnabled: Bool = true
     var clickMessages: [String] = defaultClickMessages
     var launchAtLogin: Bool = false
+    // 保留旧字段名兼容已有配置，现在控制任意所选设备的电量。
+    var showMouseBattery: Bool = false
+    var batteryDeviceID: String? = nil
+    var batteryDeviceName: String? = nil
+    /// 指定桌宠所在的显示器；nil 表示跟随当前所在显示器。
+    var preferredDisplayID: UInt32? = nil
 
     // 运行时状态（不写入用户设置界面）
     var lastPositionX: Double? = nil
     var lastPositionY: Double? = nil
+
+    init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case reminderEnabled, intervalMinutes, breakSeconds, reminderMessages
+        case quietHoursEnabled, quietStart, quietEnd, nightSilenceEnabled, nightStart, nightEnd
+        case showSystemNotification, playSound, petScale, alwaysOnTop, randomActionsEnabled
+        case clickMessages, launchAtLogin, showMouseBattery, preferredDisplayID
+        case batteryDeviceID, batteryDeviceName
+        case lastPositionX, lastPositionY
+    }
+
+    /// 新版本增加字段时，旧配置保留已有设置，缺失字段沿用默认值。
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        reminderEnabled = try c.decodeIfPresent(Bool.self, forKey: .reminderEnabled) ?? reminderEnabled
+        intervalMinutes = try c.decodeIfPresent(Int.self, forKey: .intervalMinutes) ?? intervalMinutes
+        breakSeconds = try c.decodeIfPresent(Int.self, forKey: .breakSeconds) ?? breakSeconds
+        reminderMessages = try c.decodeIfPresent([String].self, forKey: .reminderMessages) ?? reminderMessages
+        quietHoursEnabled = try c.decodeIfPresent(Bool.self, forKey: .quietHoursEnabled) ?? quietHoursEnabled
+        quietStart = try c.decodeIfPresent(String.self, forKey: .quietStart) ?? quietStart
+        quietEnd = try c.decodeIfPresent(String.self, forKey: .quietEnd) ?? quietEnd
+        nightSilenceEnabled = try c.decodeIfPresent(Bool.self, forKey: .nightSilenceEnabled) ?? nightSilenceEnabled
+        nightStart = try c.decodeIfPresent(String.self, forKey: .nightStart) ?? nightStart
+        nightEnd = try c.decodeIfPresent(String.self, forKey: .nightEnd) ?? nightEnd
+        showSystemNotification = try c.decodeIfPresent(Bool.self, forKey: .showSystemNotification) ?? showSystemNotification
+        playSound = try c.decodeIfPresent(Bool.self, forKey: .playSound) ?? playSound
+        petScale = try c.decodeIfPresent(Double.self, forKey: .petScale) ?? petScale
+        alwaysOnTop = try c.decodeIfPresent(Bool.self, forKey: .alwaysOnTop) ?? alwaysOnTop
+        randomActionsEnabled = try c.decodeIfPresent(Bool.self, forKey: .randomActionsEnabled) ?? randomActionsEnabled
+        clickMessages = try c.decodeIfPresent([String].self, forKey: .clickMessages) ?? clickMessages
+        launchAtLogin = try c.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? launchAtLogin
+        showMouseBattery = try c.decodeIfPresent(Bool.self, forKey: .showMouseBattery) ?? showMouseBattery
+        batteryDeviceID = try c.decodeIfPresent(String.self, forKey: .batteryDeviceID)
+        batteryDeviceName = try c.decodeIfPresent(String.self, forKey: .batteryDeviceName)
+        preferredDisplayID = try c.decodeIfPresent(UInt32.self, forKey: .preferredDisplayID)
+        lastPositionX = try c.decodeIfPresent(Double.self, forKey: .lastPositionX)
+        lastPositionY = try c.decodeIfPresent(Double.self, forKey: .lastPositionY)
+    }
 
     static let storePath: URL = {
         let dir: URL

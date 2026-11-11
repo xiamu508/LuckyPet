@@ -15,7 +15,8 @@ python3 scripts/verify_assets.py
 echo "== 1/6 编译 =="
 swiftc -swift-version 5 -O -module-cache-path "$CACHE" -o "$BIN" "$SRC"/*.swift \
     -framework Cocoa -framework AVFoundation \
-    -framework UserNotifications -framework ServiceManagement
+    -framework UserNotifications -framework ServiceManagement -framework IOKit \
+    -framework CoreBluetooth -framework IOBluetooth -framework GameController
 
 echo "== 2/6 准备图标 =="
 # 复用项目内的原版图标；只有图标缺失时才重新生成。

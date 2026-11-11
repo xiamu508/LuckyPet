@@ -153,6 +153,23 @@ final class PetWindow: NSWindow {
         return NSScreen.screens.first(where: { $0.frame.contains(center) }) ?? screen ?? NSScreen.main
     }
 
+    /// 当前桌宠所在的显示器 ID。显示器 ID 是 macOS 为每块屏幕分配的稳定标识，
+    /// 比显示器名称更适合持久化到配置文件。
+    var currentDisplayID: UInt32? {
+        Self.displayID(for: placementScreen)
+    }
+
+    static func displayID(for screen: NSScreen?) -> UInt32? {
+        guard let number = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+            return nil
+        }
+        return number.uint32Value
+    }
+
+    static func screen(forDisplayID displayID: UInt32) -> NSScreen? {
+        NSScreen.screens.first { Self.displayID(for: $0) == displayID }
+    }
+
     private static func measureRestingBounds(library: ClipLibrary) -> NSRect {
         let fallback = NSRect(x: 190, y: 20, width: 260, height: 300)
         guard let url = library.idle.clips.first else { return fallback }
@@ -458,6 +475,37 @@ final class PetWindow: NSWindow {
         prefs.alwaysOnTop = on
         level = on ? .statusBar : .normal
         prefs.save()
+    }
+
+    /// 把桌宠移动到指定显示器，同时尽量保持它在原显示器中的相对位置。
+    @discardableResult
+    func moveToDisplay(_ displayID: UInt32) -> Bool {
+        guard !isReminderActive,
+              let target = Self.screen(forDisplayID: displayID),
+              let source = placementScreen else { return false }
+
+        if Self.displayID(for: source) == displayID {
+            keepFullyOnScreen()
+            return true
+        }
+
+        let sourceVisible = source.visibleFrame
+        let targetVisible = target.visibleFrame
+        let center = NSPoint(x: visiblePetFrame.midX, y: visiblePetFrame.midY)
+        let xRatio = sourceVisible.width > 0
+            ? min(max((center.x - sourceVisible.minX) / sourceVisible.width, 0), 1)
+            : 0.5
+        let yRatio = sourceVisible.height > 0
+            ? min(max((center.y - sourceVisible.minY) / sourceVisible.height, 0), 1)
+            : 0.5
+        let targetCenter = NSPoint(x: targetVisible.minX + targetVisible.width * xRatio,
+                                   y: targetVisible.minY + targetVisible.height * yRatio)
+        let scale = displayScale
+        let origin = frameOrigin(for: scale, bodyCenter: targetCenter, on: target)
+        setWindowGeometry(frame: NSRect(origin: origin, size: frameSize(for: scale)), scale: scale)
+        keepFullyOnScreen()
+        rememberPosition()
+        return true
     }
 
     // MARK: - 提醒动效

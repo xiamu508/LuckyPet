@@ -1,6 +1,6 @@
 # 第三方素材与来源声明
 
-本项目的**源代码**（Swift / Shell / Python）为原创，采用 [MIT 许可](LICENSE)。
+本项目的**源代码**（Swift / Shell / Python）采用 [MIT 许可](LICENSE)，鼠标电量模块来源见下文。
 **角色动画素材**与**角色形象**不适用 MIT 许可，来源与授权情况如下。
 
 ---
@@ -73,3 +73,12 @@ Copyright (c) 2021, Xintao Wang，采用 BSD 3-Clause 许可。
 
 素材与角色形象的权利归各自原作者所有。若相关权利人认为本项目使用方式不妥，
 请通过 Issue 联系，将立即移除相关内容。
+
+---
+
+## 6. 鼠标电量模块
+
+MCHOSE HID 读取与报告描述符解析移植自用户提供的 MCHOSEBattery 配套源码。
+设备协议参考 [z750sasr/mchose-a5-pro-max-web-driver](https://github.com/z750sasr/mchose-a5-pro-max-web-driver)。
+此模块为非官方工具，仅在本机读取鼠标电量。
+

@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settings: SettingsWindowController!
 
     private var statusItem: NSStatusItem!
+    private let mouseBattery = MouseBatteryMonitor()
+    private lazy var deviceBattery = DeviceBatteryMonitor(mouse: mouseBattery, bluetooth: BluetoothBatteryService())
+    private var batteryDevicesWindow: BatteryDevicesWindowController?
     private var idleTimer: Timer?
     private var hidePet = false
 
@@ -25,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         pet = PetWindow(library: library, prefs: prefs)
         pet.restorePosition()
+        if let displayID = prefs.preferredDisplayID {
+            _ = pet.moveToDisplay(displayID)
+        }
         pet.orderFrontRegardless()
         pet.playIdle()
 
@@ -50,6 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         reminder.start()
 
         buildStatusItem()
+        deviceBattery.onChange = { [weak self] in
+            self?.updateStatusIcon()
+            self?.batteryDevicesWindow?.update()
+        }
+        deviceBattery.configure(enabled: prefs.showMouseBattery, selectedID: prefs.batteryDeviceID,
+                                selectedName: prefs.batteryDeviceName)
+        settings.onManageBattery = { [weak self] in self?.actionManageBattery() }
         scheduleIdleActions()
         requestNotificationPermission()
 
@@ -347,6 +360,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        deviceBattery.setEnabled(false)
+        deviceBattery.setBrowsing(false)
         if let pet {
             prefs?.lastPositionX = pet.frame.minX
             prefs?.lastPositionY = pet.frame.minY
@@ -361,6 +376,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func screenChanged() {
         guard let pet else { return }
         guard !pet.isReminderActive else { return }
+        if let displayID = prefs.preferredDisplayID,
+           PetWindow.screen(forDisplayID: displayID) != nil,
+           pet.currentDisplayID != displayID {
+            _ = pet.moveToDisplay(displayID)
+            return
+        }
         if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(pet.frame) }) {
             pet.keepFullyOnScreen()
         } else {
@@ -372,14 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        if let button = statusItem.button {
-            let icon = NSImage(systemSymbolName: "fish.fill", accessibilityDescription: "LuckyPet")
-                ?? Self.makeFishIcon()
-            icon.isTemplate = true
-            button.image = icon
-            button.toolTip = "LuckyPet · 久坐提醒"
-            NSLog("[Pet] 状态栏图标已创建 image=\(button.image != nil)")
-        }
+        updateStatusIcon()
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -392,23 +406,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// 自绘鱼形托盘图标（SF Symbol 不可用时的兜底）
-    static func makeFishIcon() -> NSImage {
-        let size = NSSize(width: 18, height: 16)
-        let img = NSImage(size: size, flipped: false) { _ in
-            let body = NSBezierPath(ovalIn: NSRect(x: 0.5, y: 3, width: 11.5, height: 10))
-            let tail = NSBezierPath()
-            tail.move(to: NSPoint(x: 11, y: 8))
-            tail.line(to: NSPoint(x: 17, y: 2.5))
-            tail.line(to: NSPoint(x: 17, y: 13.5))
-            tail.close()
-            body.append(tail)
-            NSColor.black.setFill()
-            body.fill()
-            return true
-        }
-        img.isTemplate = true
-        return img
+    private func updateStatusIcon() {
+        guard let statusItem, let button = statusItem.button, let prefs else { return }
+        statusItem.length = prefs.showMouseBattery ? 34 : NSStatusItem.squareLength
+        button.image = PetStatusIcon.image(showBattery: prefs.showMouseBattery,
+                                          reading: deviceBattery.reading,
+                                          stale: deviceBattery.isStale)
+        button.imagePosition = .imageOnly
+        button.toolTip = prefs.showMouseBattery ? deviceBattery.toolTip : "LuckyPet · 久坐提醒"
+        button.setAccessibilityLabel(prefs.showMouseBattery ? deviceBattery.statusText : "LuckyPet · 桌宠")
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -440,6 +446,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = NSMenuItem(title: "今日已提醒 \(reminder.todayCount) 次", action: nil, keyEquivalent: "")
         count.isEnabled = false
         menu.addItem(count)
+        menu.addItem(.separator())
+
+        let batteryToggle = item("显示设备电量", #selector(actionToggleMouseBattery), "")
+        batteryToggle.state = prefs.showMouseBattery ? .on : .off
+        menu.addItem(batteryToggle)
+        menu.addItem(item("设备与电量…", #selector(actionManageBattery), ""))
+        if prefs.showMouseBattery {
+            let batteryStatus = NSMenuItem(title: deviceBattery.statusText, action: nil, keyEquivalent: "")
+            batteryStatus.isEnabled = false
+            menu.addItem(batteryStatus)
+            if let reading = deviceBattery.reading {
+                let updated = NSMenuItem(title: "更新于 \(MouseBatteryMonitor.timeFormatter.string(from: reading.timestamp))",
+                                         action: nil, keyEquivalent: "")
+                updated.isEnabled = false
+                menu.addItem(updated)
+            }
+            if let message = deviceBattery.selectedDevice.message {
+                let errorItem = NSMenuItem(title: message, action: nil, keyEquivalent: "")
+                errorItem.isEnabled = false
+                menu.addItem(errorItem)
+            }
+            let refresh = item("立即刷新设备电量", #selector(actionRefreshMouseBattery), "")
+            refresh.isEnabled = !deviceBattery.isRefreshing
+            menu.addItem(refresh)
+        }
         menu.addItem(.separator())
 
         menu.addItem(item("摸摸头", #selector(actionPat), "t"))
@@ -484,6 +515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         top.state = prefs.alwaysOnTop ? .on : .off
         menu.addItem(top)
 
+        menu.addItem(displayAssignmentMenuItem())
+
         menu.addItem(.separator())
         menu.addItem(item("提醒设置…", #selector(actionSettings), ","))
         menu.addItem(item("打开配置目录", #selector(actionOpenConfigDir), ""))
@@ -497,6 +530,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
+    private func displayAssignmentMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "分配到显示器", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let follow = NSMenuItem(title: "跟随桌宠当前屏幕",
+                                action: #selector(actionFollowCurrentDisplay),
+                                keyEquivalent: "")
+        follow.target = self
+        follow.state = prefs.preferredDisplayID == nil ? .on : .off
+        submenu.addItem(follow)
+
+        let screens = NSScreen.screens.sorted { lhs, rhs in
+            (PetWindow.displayID(for: lhs) ?? 0) < (PetWindow.displayID(for: rhs) ?? 0)
+        }
+        if !screens.isEmpty { submenu.addItem(.separator()) }
+        let mainDisplayID = PetWindow.displayID(for: NSScreen.main)
+        for screen in screens {
+            guard let displayID = PetWindow.displayID(for: screen) else { continue }
+            let title = displayID == mainDisplayID
+                ? "主显示器 · \(screen.localizedName)"
+                : screen.localizedName
+            let entry = NSMenuItem(title: title,
+                                   action: #selector(actionAssignDisplay(_:)),
+                                   keyEquivalent: "")
+            entry.target = self
+            entry.representedObject = NSNumber(value: displayID)
+            entry.state = prefs.preferredDisplayID == displayID ? .on : .off
+            submenu.addItem(entry)
+        }
+        item.submenu = submenu
+        return item
+    }
+
     private func popUpPetMenu(at screenPoint: NSPoint) {
         let menu = NSMenu()
         menu.addItem(item("摸摸头", #selector(actionPat), ""))
@@ -504,6 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("暂停 30 分钟", #selector(actionPause30), ""))
         menu.addItem(.separator())
         menu.addItem(item("提醒设置…", #selector(actionSettings), ""))
+        menu.addItem(displayAssignmentMenuItem())
         menu.addItem(item("隐藏桌宠", #selector(actionToggleVisible), ""))
         menu.addItem(.separator())
         menu.addItem(item("退出", #selector(actionQuit), ""))
@@ -511,6 +577,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // MARK: - 菜单动作
+
+    @objc private func actionToggleMouseBattery() {
+        prefs.showMouseBattery.toggle()
+        prefs.save()
+        pet.prefs.showMouseBattery = prefs.showMouseBattery
+        settings.updateMouseBatteryVisibility(prefs.showMouseBattery)
+        deviceBattery.setEnabled(prefs.showMouseBattery)
+        updateStatusIcon()
+    }
+
+    @objc private func actionRefreshMouseBattery() {
+        deviceBattery.refresh()
+    }
+
+    @objc private func actionManageBattery() {
+        if batteryDevicesWindow == nil {
+            batteryDevicesWindow = BatteryDevicesWindowController(monitor: deviceBattery,
+                selectDevice: { [weak self] device in
+                    guard let self else { return }
+                    self.prefs.batteryDeviceID = device.id
+                    self.prefs.batteryDeviceName = device.name
+                    self.prefs.showMouseBattery = true
+                    self.prefs.save()
+                    self.pet.prefs = self.prefs
+                    self.settings.updateBatterySelection(self.prefs)
+                    self.deviceBattery.configure(enabled: true, selectedID: device.id, selectedName: device.name)
+                }, toggleEnabled: { [weak self] in self?.actionToggleMouseBattery() })
+        }
+        batteryDevicesWindow?.show()
+    }
 
     @objc private func actionPat() {
         guard !pet.isReminderActive else { return }
@@ -561,6 +657,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         pet.applyAlwaysOnTop(!prefs.alwaysOnTop)
     }
 
+    @objc private func actionAssignDisplay(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? NSNumber else { return }
+        let displayID = number.uint32Value
+        guard pet.moveToDisplay(displayID) else { return }
+        prefs.preferredDisplayID = displayID
+        prefs.save()
+    }
+
+    @objc private func actionFollowCurrentDisplay() {
+        prefs.preferredDisplayID = nil
+        prefs.save()
+    }
+
     @objc private func actionSettings() {
         settings.show(prefs: prefs,
                       onChange: { [weak self] newPrefs in
@@ -568,11 +677,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                           let oldTop = self.prefs.alwaysOnTop
                           let oldScale = self.prefs.petScale
                           let oldLaunch = self.prefs.launchAtLogin
+                          let oldDisplay = self.prefs.preferredDisplayID
                           self.prefs = newPrefs
+                          self.pet.prefs = newPrefs
                           newPrefs.save()
                           self.reminder.prefs = newPrefs
+                          self.deviceBattery.configure(enabled: newPrefs.showMouseBattery, selectedID: newPrefs.batteryDeviceID,
+                                                       selectedName: newPrefs.batteryDeviceName)
+                          self.updateStatusIcon()
                           if abs(oldScale - newPrefs.petScale) > 0.001 {
-                              self.pet.prefs = newPrefs
                               if !self.pet.isReminderActive { self.pet.applyGeometry() }
                           }
                           if oldTop != newPrefs.alwaysOnTop {
@@ -580,6 +693,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                           }
                           if oldLaunch != newPrefs.launchAtLogin {
                               self.setLaunchAtLogin(newPrefs.launchAtLogin)
+                          }
+                          if oldDisplay != newPrefs.preferredDisplayID,
+                             let displayID = newPrefs.preferredDisplayID {
+                              _ = self.pet.moveToDisplay(displayID)
                           }
                       },
                       onFireNow: { [weak self] in
